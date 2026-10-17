@@ -2,7 +2,7 @@ use crate::optimizer::analyze_memory_block;
 use crate::protocol::{CallToolResult, Tool};
 use engine_core::{
     assemble_code, build_detour_hook, find_xrefs_in_code, generate_pattern_from_bytes,
-    FirstScanMode, MemoryScanner, NextScanMode, ScanConfig, ScanValue, ScanValueType,
+    ClassStructure, FirstScanMode, MemoryScanner, NextScanMode, ScanConfig, ScanValue, ScanValueType,
 };
 use engine_pal::{
     default_backend, default_enumerator, Address, ProcessAccessLayer, ProcessId, ProtectionFlags,
@@ -304,6 +304,53 @@ pub fn list_tools() -> Vec<Tool> {
                     "address": { "type": "string", "description": "Hex address of allocated memory to free" }
                 },
                 "required": ["address"]
+            }),
+        },
+        Tool {
+            name: "struct_reconstruct".to_string(),
+            description: "Reconstruct a C/C++ game object class layout from memory (ReClass style). Heuristically classifies VTable pointers, 3D Vector3 coordinates, pointers to heap/code, inline strings, floats, ints, and padding.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Base hex address of object (e.g. '0x7FFC968E1360')" },
+                    "size": { "type": "integer", "default": 128, "description": "Number of bytes to inspect (default: 128, max: 1024)" },
+                    "class_name": { "type": "string", "description": "Optional name for class (e.g. 'PlayerEntity')" }
+                },
+                "required": ["address"]
+            }),
+        },
+        Tool {
+            name: "struct_export".to_string(),
+            description: "Export reconstructed object structure layout directly into clean C++, Rust, or C# code definitions with correct field offsets, padding, and static asserts.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Base hex address of object" },
+                    "size": { "type": "integer", "default": 128, "description": "Number of bytes to inspect" },
+                    "language": {
+                        "type": "string",
+                        "enum": ["cpp", "rust", "csharp"],
+                        "default": "cpp",
+                        "description": "Target programming language"
+                    },
+                    "class_name": { "type": "string", "default": "ReconstructedClass", "description": "Class name" }
+                },
+                "required": ["address"]
+            }),
+        },
+        Tool {
+            name: "struct_rename_field".to_string(),
+            description: "Rename a field in a reconstructed structure by offset (useful for AI agents labeling game variables like 'health', 'position', 'vtable') and return updated definition.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Base hex address of object" },
+                    "size": { "type": "integer", "default": 128, "description": "Number of bytes" },
+                    "class_name": { "type": "string", "default": "ReconstructedClass", "description": "Class name" },
+                    "field_offset": { "type": "string", "description": "Hex or decimal field offset (e.g. '0x10' or '16')" },
+                    "new_name": { "type": "string", "description": "New variable name (e.g. 'm_vecPosition')" }
+                },
+                "required": ["address", "field_offset", "new_name"]
             }),
         },
     ]
@@ -1053,6 +1100,108 @@ pub fn dispatch_tool_call(
                 }))
                 .unwrap_or_else(|e| CallToolResult::error(e.to_string())),
                 Err(e) => CallToolResult::error(format!("Failed to free memory: {e}")),
+            }
+        }
+        "struct_reconstruct" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing parameter 'address'"),
+            };
+            let address = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
+            };
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(128).min(1024) as usize;
+            let class_name = args.get("class_name").and_then(|v| v.as_str()).unwrap_or("ReconstructedClass");
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+
+            let bytes = match session.pal.read_raw(address, size) {
+                Ok(b) => b,
+                Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
+            };
+            let regions = session.pal.query_regions().unwrap_or_default();
+            let structure = ClassStructure::reconstruct(address, &bytes, &regions, Some(class_name));
+
+            CallToolResult::json(&structure).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+        }
+        "struct_export" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing parameter 'address'"),
+            };
+            let address = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
+            };
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(128).min(1024) as usize;
+            let lang = args.get("language").and_then(|v| v.as_str()).unwrap_or("cpp");
+            let class_name = args.get("class_name").and_then(|v| v.as_str()).unwrap_or("ReconstructedClass");
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+
+            let bytes = match session.pal.read_raw(address, size) {
+                Ok(b) => b,
+                Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
+            };
+            let regions = session.pal.query_regions().unwrap_or_default();
+            let structure = ClassStructure::reconstruct(address, &bytes, &regions, Some(class_name));
+
+            let code = match lang.to_lowercase().as_str() {
+                "rust" | "rs" => structure.to_rust(),
+                "cs" | "csharp" => structure.to_csharp(),
+                _ => structure.to_cpp(),
+            };
+
+            CallToolResult::text(code)
+        }
+        "struct_rename_field" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing parameter 'address'"),
+            };
+            let address = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
+            };
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(128).min(1024) as usize;
+            let class_name = args.get("class_name").and_then(|v| v.as_str()).unwrap_or("ReconstructedClass");
+
+            let offset_str = match args.get("field_offset").and_then(|v| v.as_str()) {
+                Some(o) => o,
+                None => return CallToolResult::error("Missing parameter 'field_offset'"),
+            };
+            let offset = match parse_hex_or_dec_address(offset_str) {
+                Some(a) => a.as_u64() as usize,
+                None => return CallToolResult::error(format!("Invalid field_offset: '{offset_str}'")),
+            };
+
+            let new_name = match args.get("new_name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return CallToolResult::error("Missing parameter 'new_name'"),
+            };
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+
+            let bytes = match session.pal.read_raw(address, size) {
+                Ok(b) => b,
+                Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
+            };
+            let regions = session.pal.query_regions().unwrap_or_default();
+            let mut structure = ClassStructure::reconstruct(address, &bytes, &regions, Some(class_name));
+
+            match structure.rename_field(offset, new_name) {
+                Ok(()) => CallToolResult::json(&structure).unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(format!("Failed to rename field: {e}")),
             }
         }
         _ => CallToolResult::error(format!("Unknown tool: '{name}'")),

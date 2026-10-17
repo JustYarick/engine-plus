@@ -4,6 +4,7 @@ pub mod event;
 pub mod hooks;
 pub mod pattern;
 pub mod scanner;
+pub mod structure;
 pub mod xrefs;
 
 pub use assembler::{assemble_code, create_absolute_jump, create_relative_jump, AssemblerError, AssemblerResult};
@@ -15,4 +16,5 @@ pub use scanner::{
     parse_aob_pattern, FirstScanMode, MemoryScanner, NextScanMode, ScanConfig, ScanMatch,
     ScanResults, ScanValue, ScanValueType,
 };
+pub use structure::{ClassStructure, FieldType, StructureError, StructureField, StructureResult};
 pub use xrefs::{find_xrefs_in_code, XRefEntry, XRefType};

@@ -238,6 +238,27 @@ enum Commands {
         #[arg(short, long)]
         address: String,
     },
+
+    /// ReClass-style object structure reconstruction and code generation (C++, Rust, C#)
+    Struct {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        #[arg(short, long)]
+        address: String,
+
+        /// Number of bytes to analyze (default: 128)
+        #[arg(short, long, default_value = "128")]
+        size: usize,
+
+        /// Optional code export language: cpp, rust, csharp
+        #[arg(short, long)]
+        export: Option<String>,
+
+        /// Class name (default: ReconstructedClass)
+        #[arg(short, long, default_value = "ReconstructedClass")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -685,6 +706,34 @@ async fn main() -> anyhow::Result<()> {
             pal.attach(pid)?;
             pal.free_memory(Address::new(addr))?;
             println!("Successfully freed memory at 0x{:X}", addr);
+        }
+        Some(Commands::Struct { pid, address, size, export, name }) => {
+            let addr = parse_hex_or_dec_val(&address)
+                .ok_or_else(|| anyhow::anyhow!("Invalid address '{address}'"))?;
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+
+            let bytes = pal.read_raw(Address::new(addr), size)?;
+            let regions = pal.query_regions().unwrap_or_default();
+            let structure = engine_core::ClassStructure::reconstruct(Address::new(addr), &bytes, &regions, Some(&name));
+
+            if let Some(lang) = export {
+                let code = match lang.to_lowercase().as_str() {
+                    "rust" | "rs" => structure.to_rust(),
+                    "cs" | "csharp" => structure.to_csharp(),
+                    _ => structure.to_cpp(),
+                };
+                println!("{code}");
+            } else {
+                println!("\nReClass Node Analysis for {} at 0x{:X} (Size: 0x{:X} / {} bytes):", structure.name, addr, structure.total_size, structure.total_size);
+                println!("{:<8} {:<16} {:<12} {:<24} COMMENT", "OFFSET", "NAME", "TYPE", "VALUE");
+                println!("{:-<80}", "");
+                for f in &structure.fields {
+                    let comment = f.comment.as_deref().unwrap_or("");
+                    println!("+0x{:04X}  {:<16} {:<12} {:<24} {}", f.offset, f.name, f.field_type.type_name(), f.display_value, comment);
+                }
+                println!();
+            }
         }
     }
 

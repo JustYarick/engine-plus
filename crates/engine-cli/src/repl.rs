@@ -233,6 +233,29 @@ impl InteractiveConsole {
                         self.cmd_free(args[0])?;
                     }
                 }
+                "reclass" => {
+                    if args.is_empty() {
+                        println!("Usage: reclass <hex_address> [size] [class_name]");
+                        println!("  Example: reclass 0x7FFF1000 128 PlayerEntity");
+                    } else {
+                        let addr_str = args[0];
+                        let size = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(128);
+                        let name = args.get(2).copied().unwrap_or("ReconstructedClass");
+                        self.cmd_reclass(addr_str, size, name)?;
+                    }
+                }
+                "export_struct" | "export" => {
+                    if args.is_empty() {
+                        println!("Usage: export <hex_address> [size] [cpp|rust|csharp] [class_name]");
+                        println!("  Example: export 0x7FFF1000 128 cpp PlayerEntity");
+                    } else {
+                        let addr_str = args[0];
+                        let size = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(128);
+                        let lang = args.get(2).copied().unwrap_or("cpp");
+                        let name = args.get(3).copied().unwrap_or("ReconstructedClass");
+                        self.cmd_export_struct(addr_str, size, lang, name)?;
+                    }
+                }
                 _ => {
                     println!("Unknown command: '{cmd}'. Type 'help' for available commands.");
                 }
@@ -255,6 +278,8 @@ impl InteractiveConsole {
         println!("  write <addr> <val> [type]   - Write memory at hex address (e.g. 'write 0x7FFF1000 999 i32')");
         println!("  disasm <addr> [size] [bits] - Disassemble memory instructions via iced-x86");
         println!("  analyze <addr> [size]       - Heuristic object structure analyzer (pointers, floats, zeros)");
+        println!("  reclass <addr> [size] [name]- ReClass-style node memory reconstruction (VTable, Vector3, etc.)");
+        println!("  export <addr> [sz] [lang]   - Export reconstructed class into C++, Rust, or C# code");
         println!("  asm <code...> [bits]        - Assemble instructions into machine code (e.g. 'asm xor eax, eax; ret')");
         println!("  patch <addr> <asm|hex:>     - Patch instructions or bytes at address (e.g. 'patch 0x1000 nop; nop')");
         println!("  hook <target> <cave> [asm]  - Build & install detour trampoline hook with code cave");
@@ -758,6 +783,62 @@ impl InteractiveConsole {
             Ok(()) => println!("Freed memory at 0x{:X}", addr.as_u64()),
             Err(e) => println!("Free error: {e}"),
         }
+        Ok(())
+    }
+
+    fn cmd_reclass(&self, addr_str: &str, size: usize, name: &str) -> anyhow::Result<()> {
+        let addr = match parse_hex_or_dec(addr_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid address: '{addr_str}'");
+                return Ok(());
+            }
+        };
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <pid>' first.");
+            return Ok(());
+        }
+
+        let bytes = self.pal.read_raw(addr, size)?;
+        let regions = self.pal.query_regions().unwrap_or_default();
+        let structure = engine_core::ClassStructure::reconstruct(addr, &bytes, &regions, Some(name));
+
+        println!("\nReClass Node Analysis for {} at 0x{:X} (Size: 0x{:X} / {} bytes):", structure.name, addr.as_u64(), structure.total_size, structure.total_size);
+        println!("{:<8} {:<16} {:<12} {:<24} COMMENT", "OFFSET", "NAME", "TYPE", "VALUE");
+        println!("{:-<80}", "");
+
+        for f in &structure.fields {
+            let comment = f.comment.as_deref().unwrap_or("");
+            println!("+0x{:04X}  {:<16} {:<12} {:<24} {}", f.offset, f.name, f.field_type.type_name(), f.display_value, comment);
+        }
+        println!();
+        Ok(())
+    }
+
+    fn cmd_export_struct(&self, addr_str: &str, size: usize, lang: &str, name: &str) -> anyhow::Result<()> {
+        let addr = match parse_hex_or_dec(addr_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid address: '{addr_str}'");
+                return Ok(());
+            }
+        };
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <pid>' first.");
+            return Ok(());
+        }
+
+        let bytes = self.pal.read_raw(addr, size)?;
+        let regions = self.pal.query_regions().unwrap_or_default();
+        let structure = engine_core::ClassStructure::reconstruct(addr, &bytes, &regions, Some(name));
+
+        let code = match lang.to_lowercase().as_str() {
+            "rust" | "rs" => structure.to_rust(),
+            "cs" | "csharp" => structure.to_csharp(),
+            _ => structure.to_cpp(),
+        };
+
+        println!("{code}");
         Ok(())
     }
 }

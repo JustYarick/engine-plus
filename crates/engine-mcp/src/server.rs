@@ -177,7 +177,7 @@ mod tests {
         let resp = server.handle_request(req).expect("should return response");
         let result = resp.result.expect("should have result");
         let tools = result["tools"].as_array().expect("tools array");
-        assert!(tools.len() >= 15);
+        assert!(tools.len() >= 18);
         assert!(tools.iter().any(|t| t["name"] == "process_list"));
         assert!(tools.iter().any(|t| t["name"] == "memory_scan"));
         assert!(tools.iter().any(|t| t["name"] == "disassemble"));
@@ -187,6 +187,9 @@ mod tests {
         assert!(tools.iter().any(|t| t["name"] == "hook_install"));
         assert!(tools.iter().any(|t| t["name"] == "pattern_generate"));
         assert!(tools.iter().any(|t| t["name"] == "find_xrefs"));
+        assert!(tools.iter().any(|t| t["name"] == "struct_reconstruct"));
+        assert!(tools.iter().any(|t| t["name"] == "struct_export"));
+        assert!(tools.iter().any(|t| t["name"] == "struct_rename_field"));
     }
 
     #[test]
