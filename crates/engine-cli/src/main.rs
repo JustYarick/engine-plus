@@ -2,7 +2,7 @@ mod repl;
 
 use clap::{Parser, Subcommand};
 use engine_core::{FirstScanMode, MemoryScanner, ScanConfig, ScanValue, ScanValueType};
-use engine_pal::{default_backend, default_enumerator, Address, ProcessId};
+use engine_pal::{default_backend, default_enumerator, Address, ProcessId, ProtectionFlags};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use repl::InteractiveConsole;
 use std::path::PathBuf;
@@ -143,6 +143,100 @@ enum Commands {
         /// Path to Lua script file
         #[arg(short, long)]
         file: Option<PathBuf>,
+    },
+
+    /// Assemble x86/x64 instructions into machine code bytes
+    Assemble {
+        /// Assembly instructions separated by ';' or newlines
+        #[arg(short, long)]
+        code: String,
+
+        /// Instruction pointer hex address (default: 0x1000)
+        #[arg(short, long, default_value = "0x1000")]
+        ip: String,
+
+        /// Architecture bitness: 32 or 64
+        #[arg(short, long, default_value = "64")]
+        bitness: u32,
+    },
+
+    /// Patch machine code at an address in target process
+    Patch {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        #[arg(short, long)]
+        address: String,
+
+        /// Assembly instructions or hex bytes (e.g. 'nop; nop' or 'hex: 90 90')
+        #[arg(short, long)]
+        code: String,
+    },
+
+    /// Install inline detour/trampoline hook
+    Hook {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        /// Function address to hook
+        #[arg(short, long)]
+        target: String,
+
+        /// Code cave memory address
+        #[arg(short, long)]
+        cave: String,
+
+        /// Optional assembly payload in code cave
+        #[arg(short = 'l', long)]
+        payload: Option<String>,
+    },
+
+    /// Generate unique AOB pattern with wildcard relative masks
+    Pattern {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        #[arg(short, long)]
+        address: String,
+
+        #[arg(short, long, default_value = "32")]
+        size: usize,
+    },
+
+    /// Scan code for cross-references to a target address
+    Xrefs {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        #[arg(short, long)]
+        target: String,
+
+        #[arg(short, long)]
+        start: String,
+
+        #[arg(short, long, default_value = "65536")]
+        size: usize,
+    },
+
+    /// Allocate virtual memory in target process
+    Alloc {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        #[arg(short, long, default_value = "4096")]
+        size: usize,
+
+        #[arg(short, long, default_value = "rwx")]
+        protection: String,
+    },
+
+    /// Free allocated virtual memory in target process
+    Free {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        #[arg(short, long)]
+        address: String,
     },
 }
 
@@ -455,6 +549,142 @@ async fn main() -> anyhow::Result<()> {
                 other => format!("{:?}", other),
             };
             println!("{val_str}");
+        }
+        Some(Commands::Assemble { code, ip, bitness }) => {
+            let addr = parse_hex_or_dec_val(&ip)
+                .ok_or_else(|| anyhow::anyhow!("Invalid ip address '{ip}'"))?;
+            let normalized = code.replace(';', "\n");
+            let bytes = engine_core::assemble_code(&normalized, bitness, addr)
+                .map_err(|e| anyhow::anyhow!("Assembly error: {e}"))?;
+            let hex_str = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+            println!("Assembled {} bytes at 0x{:X}:", bytes.len(), addr);
+            println!("  {}", hex_str);
+        }
+        Some(Commands::Patch { pid, address, code }) => {
+            let addr = parse_hex_or_dec_val(&address)
+                .ok_or_else(|| anyhow::anyhow!("Invalid address '{address}'"))?;
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let bitness = match pal.architecture() {
+                engine_pal::CpuArchitecture::X86_32 => 32,
+                engine_pal::CpuArchitecture::X86_64 => 64,
+            };
+
+            let bytes = if let Some(hex_part) = code.strip_prefix("hex:") {
+                let mut b = Vec::new();
+                for t in hex_part.split_whitespace() {
+                    b.push(u8::from_str_radix(t.trim_start_matches("0x"), 16)?);
+                }
+                b
+            } else {
+                let normalized = code.replace(';', "\n");
+                engine_core::assemble_code(&normalized, bitness, addr)
+                    .map_err(|e| anyhow::anyhow!("Assembly error: {e}"))?
+            };
+
+            let orig = pal.read_raw(Address::new(addr), bytes.len()).unwrap_or_default();
+            let orig_hex = orig.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+            pal.write_raw(Address::new(addr), &bytes)?;
+            let patch_hex = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+
+            println!("Patched 0x{:X} ({} bytes):", addr, bytes.len());
+            println!("  Original: {}", orig_hex);
+            println!("  New:      {}", patch_hex);
+        }
+        Some(Commands::Hook { pid, target, cave, payload }) => {
+            let target_addr = parse_hex_or_dec_val(&target)
+                .ok_or_else(|| anyhow::anyhow!("Invalid target address '{target}'"))?;
+            let cave_addr = parse_hex_or_dec_val(&cave)
+                .ok_or_else(|| anyhow::anyhow!("Invalid cave address '{cave}'"))?;
+
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let bitness = match pal.architecture() {
+                engine_pal::CpuArchitecture::X86_32 => 32,
+                engine_pal::CpuArchitecture::X86_64 => 64,
+            };
+
+            let original_slice = pal.read_raw(Address::new(target_addr), 32)?;
+            let payload_bytes = if let Some(p) = payload {
+                let normalized = p.replace(';', "\n");
+                engine_core::assemble_code(&normalized, bitness, cave_addr)
+                    .map_err(|e| anyhow::anyhow!("Payload assembly error: {e}"))?
+            } else {
+                Vec::new()
+            };
+
+            let package = engine_core::build_detour_hook(
+                &original_slice,
+                target_addr,
+                cave_addr,
+                bitness,
+                &payload_bytes,
+            ).map_err(|e| anyhow::anyhow!("Hook generation error: {e}"))?;
+
+            pal.write_raw(Address::new(cave_addr), &package.code_cave_bytes)?;
+            pal.write_raw(Address::new(target_addr), &package.patch_bytes)?;
+
+            println!("Detour hook installed successfully!");
+            println!("  Target:       0x{:X}", target_addr);
+            println!("  Code Cave:    0x{:X} ({} bytes)", cave_addr, package.code_cave_bytes.len());
+            println!("  Stolen bytes: {} bytes", package.original_bytes.len());
+            println!("  Return addr:  0x{:X}", package.return_address.as_u64());
+        }
+        Some(Commands::Pattern { pid, address, size }) => {
+            let addr = parse_hex_or_dec_val(&address)
+                .ok_or_else(|| anyhow::anyhow!("Invalid address '{address}'"))?;
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let bitness = match pal.architecture() {
+                engine_pal::CpuArchitecture::X86_32 => 32,
+                engine_pal::CpuArchitecture::X86_64 => 64,
+            };
+
+            let bytes = pal.read_raw(Address::new(addr), size)?;
+            let pattern = engine_core::generate_pattern_from_bytes(&bytes, addr, bitness, size)
+                .map_err(|e| anyhow::anyhow!("Pattern generation error: {e}"))?;
+            let wildcards = pattern.split_whitespace().filter(|t| *t == "??").count();
+            println!("Generated AOB Pattern ({} bytes, {} wildcards):", pattern.split_whitespace().count(), wildcards);
+            println!("  {}", pattern);
+        }
+        Some(Commands::Xrefs { pid, target, start, size }) => {
+            let target_addr = parse_hex_or_dec_val(&target)
+                .ok_or_else(|| anyhow::anyhow!("Invalid target address '{target}'"))?;
+            let start_addr = parse_hex_or_dec_val(&start)
+                .ok_or_else(|| anyhow::anyhow!("Invalid start address '{start}'"))?;
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let bitness = match pal.architecture() {
+                engine_pal::CpuArchitecture::X86_32 => 32,
+                engine_pal::CpuArchitecture::X86_64 => 64,
+            };
+
+            let bytes = pal.read_raw(Address::new(start_addr), size)?;
+            let xrefs = engine_core::find_xrefs_in_code(&bytes, start_addr, bitness, target_addr);
+            println!("Found {} cross-references to 0x{:X}:", xrefs.len(), target_addr);
+            for x in xrefs {
+                println!("  0x{:X} [{:?}] {}", x.instruction_address.as_u64(), x.xref_type, x.instruction_text);
+            }
+        }
+        Some(Commands::Alloc { pid, size, protection }) => {
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let prot = match protection.to_lowercase().as_str() {
+                "rw" => ProtectionFlags::RW,
+                "rx" => ProtectionFlags::RX,
+                "rwx" => ProtectionFlags::RWX,
+                _ => ProtectionFlags::RWX,
+            };
+            let addr = pal.allocate_memory(size, prot)?;
+            println!("Successfully allocated {} bytes at 0x{:X} ({})", size, addr.as_u64(), protection);
+        }
+        Some(Commands::Free { pid, address }) => {
+            let addr = parse_hex_or_dec_val(&address)
+                .ok_or_else(|| anyhow::anyhow!("Invalid address '{address}'"))?;
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            pal.free_memory(Address::new(addr))?;
+            println!("Successfully freed memory at 0x{:X}", addr);
         }
     }
 

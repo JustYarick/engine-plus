@@ -1,7 +1,12 @@
 use crate::optimizer::analyze_memory_block;
 use crate::protocol::{CallToolResult, Tool};
-use engine_core::{FirstScanMode, MemoryScanner, NextScanMode, ScanConfig, ScanValue, ScanValueType};
-use engine_pal::{default_backend, default_enumerator, Address, ProcessAccessLayer, ProcessId};
+use engine_core::{
+    assemble_code, build_detour_hook, find_xrefs_in_code, generate_pattern_from_bytes,
+    FirstScanMode, MemoryScanner, NextScanMode, ScanConfig, ScanValue, ScanValueType,
+};
+use engine_pal::{
+    default_backend, default_enumerator, Address, ProcessAccessLayer, ProcessId, ProtectionFlags,
+};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -204,6 +209,101 @@ pub fn list_tools() -> Vec<Tool> {
                     "bitness": { "type": "integer", "enum": [32, 64], "default": 64, "description": "Architecture bitness" }
                 },
                 "required": ["path"]
+            }),
+        },
+        Tool {
+            name: "assemble".to_string(),
+            description: "Assemble x86/x64 assembly instructions into machine code bytes. Supports instructions (mov, push, pop, add, sub, xor, jmp, call, ret, nop, etc.) and 'db'/'hex:' directives.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string", "description": "Assembly code instructions separated by newlines (e.g. 'xor eax, eax\\nret')" },
+                    "ip": { "type": "string", "default": "0x1000", "description": "Base instruction pointer hex address" },
+                    "bitness": { "type": "integer", "enum": [32, 64], "default": 64, "description": "Target architecture bitness" }
+                },
+                "required": ["code"]
+            }),
+        },
+        Tool {
+            name: "code_patch".to_string(),
+            description: "Patch executable code at a specific memory address with assembly instructions or hex bytes. Automatically saves original bytes for rollback safety and supports NOP padding.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Target hex memory address (e.g. '0x7FFC968E1360')" },
+                    "asm": { "type": "string", "description": "Assembly instructions to compile and write (e.g. 'nop\\nnop' or 'xor eax, eax')" },
+                    "hex": { "type": "string", "description": "Alternative raw hex bytes to write (e.g. '90 90 90' or '31 C0 C3')" },
+                    "nop_pad_to": { "type": "integer", "description": "Optional minimum total byte length to pad with NOPs (0x90)" }
+                },
+                "required": ["address"]
+            }),
+        },
+        Tool {
+            name: "hook_install".to_string(),
+            description: "Install an inline detour/trampoline hook. Disassembles target site to calculate safe stolen byte boundaries, writes jump to code cave containing payload + stolen instructions, and jumps back to normal flow.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_address": { "type": "string", "description": "Address of instruction/function to hook (e.g. '0x7FFC968E1360')" },
+                    "cave_address": { "type": "string", "description": "Address of allocated executable memory for trampoline/code cave (e.g. '0x7FFD00000000')" },
+                    "payload_asm": { "type": "string", "description": "Optional assembly payload to execute before original instructions" },
+                    "payload_hex": { "type": "string", "description": "Optional raw hex machine code payload to execute before original instructions" }
+                },
+                "required": ["target_address", "cave_address"]
+            }),
+        },
+        Tool {
+            name: "pattern_generate".to_string(),
+            description: "Generate an AOB byte signature pattern with wildcards ('??') automatically masking relative call/jump offsets and RIP-relative displacements. Creates signatures resilient across game updates.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Start address of function or code block" },
+                    "size": { "type": "integer", "default": 32, "description": "Number of bytes to analyze (default: 32, max: 128)" },
+                    "bitness": { "type": "integer", "enum": [32, 64], "description": "Optional bitness override (defaults to attached process arch)" }
+                },
+                "required": ["address"]
+            }),
+        },
+        Tool {
+            name: "find_xrefs".to_string(),
+            description: "Scan code memory for cross-references (calls, jumps, and RIP-relative data loads) pointing to a target address.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_address": { "type": "string", "description": "Address of target function or data to find references to" },
+                    "search_start": { "type": "string", "description": "Starting address of memory region/module to scan" },
+                    "search_size": { "type": "integer", "description": "Number of bytes to scan (e.g. 65536 or module size)" },
+                    "bitness": { "type": "integer", "enum": [32, 64], "description": "Optional bitness override" }
+                },
+                "required": ["target_address", "search_start", "search_size"]
+            }),
+        },
+        Tool {
+            name: "memory_allocate".to_string(),
+            description: "Allocate virtual memory in target process (e.g. for code caves, injected payload, or detour trampolines).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "size": { "type": "integer", "default": 4096, "description": "Number of bytes to allocate (e.g. 4096)" },
+                    "protection": {
+                        "type": "string",
+                        "enum": ["rw", "rx", "rwx"],
+                        "default": "rwx",
+                        "description": "Memory protection flags"
+                    }
+                }
+            }),
+        },
+        Tool {
+            name: "memory_free".to_string(),
+            description: "Free previously allocated virtual memory in target process.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Hex address of allocated memory to free" }
+                },
+                "required": ["address"]
             }),
         },
     ]
@@ -641,6 +741,320 @@ pub fn dispatch_tool_call(
                 Err(e) => CallToolResult::error(e),
             }
         }
+        "assemble" => {
+            let code = match args.get("code").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return CallToolResult::error("Missing parameter 'code'"),
+            };
+            let ip = match args.get("ip").and_then(|v| v.as_str()) {
+                Some(s) => match parse_hex_or_dec_address(s) {
+                    Some(a) => a.as_u64(),
+                    None => return CallToolResult::error(format!("Invalid ip hex address: '{s}'")),
+                },
+                None => 0x1000,
+            };
+            let bitness = args.get("bitness").and_then(|v| v.as_u64()).unwrap_or(64) as u32;
+
+            match assemble_code(code, bitness, ip) {
+                Ok(bytes) => {
+                    let hex_str = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                    CallToolResult::json(&json!({
+                        "hex": hex_str,
+                        "bytes": bytes,
+                        "length": bytes.len(),
+                        "ip": format!("0x{ip:X}")
+                    }))
+                    .unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+                Err(e) => CallToolResult::error(format!("Assembly error: {e}")),
+            }
+        }
+        "code_patch" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing parameter 'address'"),
+            };
+            let address = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
+            };
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+            let bitness = match session.pal.architecture() {
+                engine_pal::CpuArchitecture::X86_32 => 32,
+                engine_pal::CpuArchitecture::X86_64 => 64,
+            };
+
+            let mut patch_bytes = if let Some(asm) = args.get("asm").and_then(|v| v.as_str()) {
+                match assemble_code(asm, bitness, address.as_u64()) {
+                    Ok(b) => b,
+                    Err(e) => return CallToolResult::error(format!("Assembly error: {e}")),
+                }
+            } else if let Some(hex_str) = args.get("hex").and_then(|v| v.as_str()) {
+                match parse_hex_bytes(hex_str) {
+                    Ok(b) => b,
+                    Err(e) => return CallToolResult::error(format!("Invalid hex bytes: {e}")),
+                }
+            } else {
+                return CallToolResult::error("Either 'asm' or 'hex' parameter must be provided");
+            };
+
+            if let Some(pad_len) = args.get("nop_pad_to").and_then(|v| v.as_u64()) {
+                let pad_len = pad_len as usize;
+                while patch_bytes.len() < pad_len {
+                    patch_bytes.push(0x90);
+                }
+            }
+
+            if patch_bytes.is_empty() {
+                return CallToolResult::error("Patch bytes are empty");
+            }
+
+            let original_bytes = match session.pal.read_raw(address, patch_bytes.len()) {
+                Ok(b) => b,
+                Err(e) => return CallToolResult::error(format!("Failed to read original bytes: {e}")),
+            };
+
+            match session.pal.write_raw(address, &patch_bytes) {
+                Ok(()) => {
+                    let orig_hex = original_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                    let patch_hex = patch_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                    CallToolResult::json(&json!({
+                        "status": "success",
+                        "address": format!("0x{:X}", address.as_u64()),
+                        "original_bytes_hex": orig_hex,
+                        "patched_bytes_hex": patch_hex,
+                        "length": patch_bytes.len()
+                    }))
+                    .unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+                Err(e) => CallToolResult::error(format!("Failed to write patch to memory: {e}")),
+            }
+        }
+        "hook_install" => {
+            let target_str = match args.get("target_address").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return CallToolResult::error("Missing parameter 'target_address'"),
+            };
+            let target_addr = match parse_hex_or_dec_address(target_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid target_address: '{target_str}'")),
+            };
+
+            let cave_str = match args.get("cave_address").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return CallToolResult::error("Missing parameter 'cave_address'"),
+            };
+            let cave_addr = match parse_hex_or_dec_address(cave_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid cave_address: '{cave_str}'")),
+            };
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+            let bitness = match session.pal.architecture() {
+                engine_pal::CpuArchitecture::X86_32 => 32,
+                engine_pal::CpuArchitecture::X86_64 => 64,
+            };
+
+            let original_slice = match session.pal.read_raw(target_addr, 32) {
+                Ok(b) => b,
+                Err(e) => return CallToolResult::error(format!("Failed to read target instructions: {e}")),
+            };
+
+            let mut payload = Vec::new();
+            if let Some(asm) = args.get("payload_asm").and_then(|v| v.as_str()) {
+                match assemble_code(asm, bitness, cave_addr.as_u64()) {
+                    Ok(b) => payload = b,
+                    Err(e) => return CallToolResult::error(format!("Payload assembly error: {e}")),
+                }
+            } else if let Some(hex_str) = args.get("payload_hex").and_then(|v| v.as_str()) {
+                match parse_hex_bytes(hex_str) {
+                    Ok(b) => payload = b,
+                    Err(e) => return CallToolResult::error(format!("Payload hex error: {e}")),
+                }
+            }
+
+            match build_detour_hook(
+                &original_slice,
+                target_addr.as_u64(),
+                cave_addr.as_u64(),
+                bitness,
+                &payload,
+            ) {
+                Ok(package) => {
+                    if let Err(e) = session.pal.write_raw(cave_addr, &package.code_cave_bytes) {
+                        return CallToolResult::error(format!("Failed to write code cave bytes: {e}"));
+                    }
+                    if let Err(e) = session.pal.write_raw(target_addr, &package.patch_bytes) {
+                        return CallToolResult::error(format!("Failed to write detour patch: {e}"));
+                    }
+
+                    let orig_hex = package.original_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                    let patch_hex = package.patch_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                    let cave_hex = package.code_cave_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+
+                    CallToolResult::json(&json!({
+                        "status": "hook_installed",
+                        "target_address": format!("0x{:X}", target_addr.as_u64()),
+                        "cave_address": format!("0x{:X}", cave_addr.as_u64()),
+                        "stolen_bytes_count": package.original_bytes.len(),
+                        "return_address": format!("0x{:X}", package.return_address.as_u64()),
+                        "target_patch_hex": patch_hex,
+                        "original_bytes_hex": orig_hex,
+                        "code_cave_hex": cave_hex
+                    }))
+                    .unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+                Err(e) => CallToolResult::error(format!("Failed to build detour hook: {e}")),
+            }
+        }
+        "pattern_generate" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing parameter 'address'"),
+            };
+            let address = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
+            };
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(32).min(128) as usize;
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+            let bitness = args.get("bitness").and_then(|v| v.as_u64()).map(|b| b as u32).unwrap_or_else(|| {
+                match session.pal.architecture() {
+                    engine_pal::CpuArchitecture::X86_32 => 32,
+                    engine_pal::CpuArchitecture::X86_64 => 64,
+                }
+            });
+
+            let code_bytes = match session.pal.read_raw(address, size) {
+                Ok(b) => b,
+                Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
+            };
+
+            match generate_pattern_from_bytes(&code_bytes, address.as_u64(), bitness, size) {
+                Ok(pattern) => {
+                    let wildcard_count = pattern.split_whitespace().filter(|t| *t == "??").count();
+                    let total_tokens = pattern.split_whitespace().count();
+                    CallToolResult::json(&json!({
+                        "address": format!("0x{:X}", address.as_u64()),
+                        "pattern": pattern,
+                        "total_bytes": total_tokens,
+                        "wildcards": wildcard_count
+                    }))
+                    .unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+                Err(e) => CallToolResult::error(format!("Pattern generation error: {e}")),
+            }
+        }
+        "find_xrefs" => {
+            let target_str = match args.get("target_address").and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => return CallToolResult::error("Missing parameter 'target_address'"),
+            };
+            let target_addr = match parse_hex_or_dec_address(target_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid target_address: '{target_str}'")),
+            };
+
+            let start_str = match args.get("search_start").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return CallToolResult::error("Missing parameter 'search_start'"),
+            };
+            let start_addr = match parse_hex_or_dec_address(start_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid search_start: '{start_str}'")),
+            };
+
+            let search_size = match args.get("search_size").and_then(|v| v.as_u64()) {
+                Some(s) => (s as usize).min(10 * 1024 * 1024),
+                None => return CallToolResult::error("Missing parameter 'search_size'"),
+            };
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+            let bitness = args.get("bitness").and_then(|v| v.as_u64()).map(|b| b as u32).unwrap_or_else(|| {
+                match session.pal.architecture() {
+                    engine_pal::CpuArchitecture::X86_32 => 32,
+                    engine_pal::CpuArchitecture::X86_64 => 64,
+                }
+            });
+
+            let code_bytes = match session.pal.read_raw(start_addr, search_size) {
+                Ok(b) => b,
+                Err(e) => return CallToolResult::error(format!("Failed to read memory at search_start: {e}")),
+            };
+
+            let xrefs = find_xrefs_in_code(&code_bytes, start_addr.as_u64(), bitness, target_addr.as_u64());
+            CallToolResult::json(&json!({
+                "target_address": format!("0x{:X}", target_addr.as_u64()),
+                "search_range": format!("0x{:X} - 0x{:X}", start_addr.as_u64(), start_addr.as_u64() + search_size as u64),
+                "count": xrefs.len(),
+                "xrefs": xrefs
+            }))
+            .unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+        }
+        "memory_allocate" => {
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+            let prot_str = args.get("protection").and_then(|v| v.as_str()).unwrap_or("rwx");
+            let protection = match prot_str.to_lowercase().as_str() {
+                "rw" => ProtectionFlags::RW,
+                "rx" => ProtectionFlags::RX,
+                "rwx" => ProtectionFlags::RWX,
+                _ => ProtectionFlags::RWX,
+            };
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+
+            match session.pal.allocate_memory(size, protection) {
+                Ok(addr) => CallToolResult::json(&json!({
+                    "status": "success",
+                    "address": format!("0x{:X}", addr.as_u64()),
+                    "size": size,
+                    "protection": prot_str
+                }))
+                .unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(format!("Memory allocation failed: {e}")),
+            }
+        }
+        "memory_free" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing parameter 'address'"),
+            };
+            let address = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
+            };
+
+            let session = session_arc.lock().unwrap();
+            if !session.pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+
+            match session.pal.free_memory(address) {
+                Ok(()) => CallToolResult::json(&json!({
+                    "status": "freed",
+                    "address": format!("0x{:X}", address.as_u64())
+                }))
+                .unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(format!("Failed to free memory: {e}")),
+            }
+        }
         _ => CallToolResult::error(format!("Unknown tool: '{name}'")),
     }
 }
@@ -652,4 +1066,15 @@ fn parse_hex_or_dec_address(s: &str) -> Option<Address> {
     } else {
         s.parse::<u64>().ok().map(Address::new)
     }
+}
+
+fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    for token in s.split_whitespace() {
+        let clean = token.trim_start_matches("0x").trim_start_matches("0X");
+        let b = u8::from_str_radix(clean, 16)
+            .map_err(|e| format!("Invalid hex byte '{token}': {e}"))?;
+        bytes.push(b);
+    }
+    Ok(bytes)
 }

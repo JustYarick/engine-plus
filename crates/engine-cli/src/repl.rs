@@ -1,5 +1,7 @@
 use engine_core::{FirstScanMode, MemoryScanner, NextScanMode, ScanConfig, ScanValue, ScanValueType};
-use engine_pal::{default_backend, default_enumerator, Address, ProcessAccessLayer, ProcessId};
+use engine_pal::{
+    default_backend, default_enumerator, Address, ProcessAccessLayer, ProcessId, ProtectionFlags,
+};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use std::io::{self, BufRead, Write};
 
@@ -157,6 +159,80 @@ impl InteractiveConsole {
                         self.cmd_lua(&code)?;
                     }
                 }
+                "asm" => {
+                    if args.is_empty() {
+                        println!("Usage: asm <instructions> [bitness]");
+                        println!("  Example: asm xor eax, eax; ret");
+                    } else {
+                        let bitness = args.last().and_then(|s| s.parse::<u32>().ok()).unwrap_or(64);
+                        let code = if args.last().is_some_and(|s| s.parse::<u32>().is_ok()) {
+                            args[..args.len() - 1].join(" ")
+                        } else {
+                            args.join(" ")
+                        };
+                        self.cmd_asm(&code, bitness)?;
+                    }
+                }
+                "patch" => {
+                    if args.len() < 2 {
+                        println!("Usage: patch <hex_address> <instructions_or_hex>");
+                        println!("  Example: patch 0x7FFF1000 nop; nop");
+                        println!("  Example: patch 0x7FFF1000 hex: 90 90 90");
+                    } else {
+                        let addr_str = args[0];
+                        let patch_str = args[1..].join(" ");
+                        self.cmd_patch(addr_str, &patch_str)?;
+                    }
+                }
+                "hook" => {
+                    if args.len() < 2 {
+                        println!("Usage: hook <target_address> <cave_address> [payload_asm]");
+                        println!("  Example: hook 0x7FFF1000 0x7FFF5000");
+                    } else {
+                        let target_str = args[0];
+                        let cave_str = args[1];
+                        let payload_str = if args.len() > 2 { Some(args[2..].join(" ")) } else { None };
+                        self.cmd_hook(target_str, cave_str, payload_str.as_deref())?;
+                    }
+                }
+                "pattern" => {
+                    if args.is_empty() {
+                        println!("Usage: pattern <hex_address> [size]");
+                        println!("  Example: pattern 0x7FFF1000 32");
+                    } else {
+                        let addr_str = args[0];
+                        let size = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(32);
+                        self.cmd_pattern(addr_str, size)?;
+                    }
+                }
+                "xrefs" => {
+                    if args.len() < 2 {
+                        println!("Usage: xrefs <target_address> <start_address> [size]");
+                        println!("  Example: xrefs 0x7FFF1000 0x7FFF0000 0x10000");
+                    } else {
+                        let target_str = args[0];
+                        let start_str = args[1];
+                        let size_str = args.get(2).copied().unwrap_or("65536");
+                        self.cmd_xrefs(target_str, start_str, size_str)?;
+                    }
+                }
+                "alloc" => {
+                    if args.is_empty() {
+                        println!("Usage: alloc <size> [rwx|rw|rx]");
+                        println!("  Example: alloc 4096 rwx");
+                    } else {
+                        let size = args[0].strip_prefix("0x").and_then(|s| usize::from_str_radix(s, 16).ok()).or_else(|| args[0].parse::<usize>().ok()).unwrap_or(4096);
+                        let prot_str = args.get(1).copied().unwrap_or("rwx");
+                        self.cmd_alloc(size, prot_str)?;
+                    }
+                }
+                "free" => {
+                    if args.is_empty() {
+                        println!("Usage: free <hex_address>");
+                    } else {
+                        self.cmd_free(args[0])?;
+                    }
+                }
                 _ => {
                     println!("Unknown command: '{cmd}'. Type 'help' for available commands.");
                 }
@@ -179,6 +255,13 @@ impl InteractiveConsole {
         println!("  write <addr> <val> [type]   - Write memory at hex address (e.g. 'write 0x7FFF1000 999 i32')");
         println!("  disasm <addr> [size] [bits] - Disassemble memory instructions via iced-x86");
         println!("  analyze <addr> [size]       - Heuristic object structure analyzer (pointers, floats, zeros)");
+        println!("  asm <code...> [bits]        - Assemble instructions into machine code (e.g. 'asm xor eax, eax; ret')");
+        println!("  patch <addr> <asm|hex:>     - Patch instructions or bytes at address (e.g. 'patch 0x1000 nop; nop')");
+        println!("  hook <target> <cave> [asm]  - Build & install detour trampoline hook with code cave");
+        println!("  pattern <addr> [size]       - Auto-generate AOB pattern with wildcard relative masks");
+        println!("  xrefs <target> <start> [sz] - Find cross-references (calls, jumps, loads) to target address");
+        println!("  alloc <size> [prot]         - Allocate memory in target process (e.g. 'alloc 4096 rwx')");
+        println!("  free <addr>                 - Free allocated memory in target process");
         println!("  lua <code>                  - Execute script in sandboxed Lua 5.4 environment");
         println!("  exit / quit                 - Quit interactive console\n");
     }
@@ -453,6 +536,228 @@ impl InteractiveConsole {
         let val = lua.load(code).eval::<engine_script::mlua::Value>()
             .map_err(|e| anyhow::anyhow!("Lua error: {e}"))?;
         println!("Lua Result: {val:?}");
+        Ok(())
+    }
+
+    fn cmd_asm(&self, code: &str, bitness: u32) -> anyhow::Result<()> {
+        let normalized = code.replace(';', "\n");
+        match engine_core::assemble_code(&normalized, bitness, 0x1000) {
+            Ok(bytes) => {
+                let hex_str = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                println!("Assembled ({} bytes): {}", bytes.len(), hex_str);
+            }
+            Err(e) => println!("Assembly error: {e}"),
+        }
+        Ok(())
+    }
+
+    fn cmd_patch(&self, addr_str: &str, patch_str: &str) -> anyhow::Result<()> {
+        let addr = match parse_hex_or_dec(addr_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid address: '{addr_str}'");
+                return Ok(());
+            }
+        };
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <pid>' first.");
+            return Ok(());
+        }
+        let bitness = match self.pal.architecture() {
+            engine_pal::CpuArchitecture::X86_32 => 32,
+            engine_pal::CpuArchitecture::X86_64 => 64,
+        };
+
+        let bytes = if let Some(hex_part) = patch_str.strip_prefix("hex:") {
+            let mut b = Vec::new();
+            for t in hex_part.split_whitespace() {
+                if let Ok(byte) = u8::from_str_radix(t.trim_start_matches("0x").trim_start_matches("0X"), 16) {
+                    b.push(byte);
+                } else {
+                    println!("Invalid hex byte: '{t}'");
+                    return Ok(());
+                }
+            }
+            b
+        } else {
+            let normalized = patch_str.replace(';', "\n");
+            match engine_core::assemble_code(&normalized, bitness, addr.as_u64()) {
+                Ok(b) => b,
+                Err(e) => {
+                    println!("Assembly error: {e}");
+                    return Ok(());
+                }
+            }
+        };
+
+        if bytes.is_empty() {
+            println!("Error: Patch is empty");
+            return Ok(());
+        }
+
+        let orig = self.pal.read_raw(addr, bytes.len()).unwrap_or_default();
+        let orig_hex = orig.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+
+        self.pal.write_raw(addr, &bytes)?;
+        let patch_hex = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+
+        println!("Patched 0x{:X} ({} bytes):", addr.as_u64(), bytes.len());
+        println!("  Original: {}", orig_hex);
+        println!("  New:      {}", patch_hex);
+        Ok(())
+    }
+
+    fn cmd_hook(&self, target_str: &str, cave_str: &str, payload_str: Option<&str>) -> anyhow::Result<()> {
+        let target_addr = match parse_hex_or_dec(target_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid target address: '{target_str}'");
+                return Ok(());
+            }
+        };
+        let cave_addr = match parse_hex_or_dec(cave_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid cave address: '{cave_str}'");
+                return Ok(());
+            }
+        };
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <pid>' first.");
+            return Ok(());
+        }
+        let bitness = match self.pal.architecture() {
+            engine_pal::CpuArchitecture::X86_32 => 32,
+            engine_pal::CpuArchitecture::X86_64 => 64,
+        };
+
+        let original_slice = self.pal.read_raw(target_addr, 32)?;
+        let payload = if let Some(p) = payload_str {
+            let normalized = p.replace(';', "\n");
+            engine_core::assemble_code(&normalized, bitness, cave_addr.as_u64()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        match engine_core::build_detour_hook(
+            &original_slice,
+            target_addr.as_u64(),
+            cave_addr.as_u64(),
+            bitness,
+            &payload,
+        ) {
+            Ok(package) => {
+                self.pal.write_raw(cave_addr, &package.code_cave_bytes)?;
+                self.pal.write_raw(target_addr, &package.patch_bytes)?;
+                println!("Hook installed successfully!");
+                println!("  Target:       0x{:X}", target_addr.as_u64());
+                println!("  Code Cave:    0x{:X} ({} bytes)", cave_addr.as_u64(), package.code_cave_bytes.len());
+                println!("  Stolen bytes: {} bytes", package.original_bytes.len());
+                println!("  Return addr:  0x{:X}", package.return_address.as_u64());
+            }
+            Err(e) => println!("Failed to build detour hook: {e}"),
+        }
+        Ok(())
+    }
+
+    fn cmd_pattern(&self, addr_str: &str, size: usize) -> anyhow::Result<()> {
+        let addr = match parse_hex_or_dec(addr_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid address: '{addr_str}'");
+                return Ok(());
+            }
+        };
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <pid>' first.");
+            return Ok(());
+        }
+        let bitness = match self.pal.architecture() {
+            engine_pal::CpuArchitecture::X86_32 => 32,
+            engine_pal::CpuArchitecture::X86_64 => 64,
+        };
+
+        let bytes = self.pal.read_raw(addr, size)?;
+        match engine_core::generate_pattern_from_bytes(&bytes, addr.as_u64(), bitness, size) {
+            Ok(pattern) => {
+                let wildcards = pattern.split_whitespace().filter(|t| *t == "??").count();
+                println!("Generated AOB Pattern ({} wildcards):", wildcards);
+                println!("  {}", pattern);
+            }
+            Err(e) => println!("Pattern error: {e}"),
+        }
+        Ok(())
+    }
+
+    fn cmd_xrefs(&self, target_str: &str, start_str: &str, size_str: &str) -> anyhow::Result<()> {
+        let target_addr = match parse_hex_or_dec(target_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid target address: '{target_str}'");
+                return Ok(());
+            }
+        };
+        let start_addr = match parse_hex_or_dec(start_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid start address: '{start_str}'");
+                return Ok(());
+            }
+        };
+        let size = size_str.strip_prefix("0x").and_then(|s| usize::from_str_radix(s, 16).ok()).or_else(|| size_str.parse::<usize>().ok()).unwrap_or(65536);
+
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <pid>' first.");
+            return Ok(());
+        }
+        let bitness = match self.pal.architecture() {
+            engine_pal::CpuArchitecture::X86_32 => 32,
+            engine_pal::CpuArchitecture::X86_64 => 64,
+        };
+
+        let bytes = self.pal.read_raw(start_addr, size)?;
+        let xrefs = engine_core::find_xrefs_in_code(&bytes, start_addr.as_u64(), bitness, target_addr.as_u64());
+        println!("Found {} cross-references to 0x{:X}:", xrefs.len(), target_addr.as_u64());
+        for x in xrefs {
+            println!("  0x{:X} [{:?}] {}", x.instruction_address.as_u64(), x.xref_type, x.instruction_text);
+        }
+        Ok(())
+    }
+
+    fn cmd_alloc(&self, size: usize, prot_str: &str) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <pid>' first.");
+            return Ok(());
+        }
+        let prot = match prot_str.to_lowercase().as_str() {
+            "rw" => ProtectionFlags::RW,
+            "rx" => ProtectionFlags::RX,
+            "rwx" => ProtectionFlags::RWX,
+            _ => ProtectionFlags::RWX,
+        };
+        match self.pal.allocate_memory(size, prot) {
+            Ok(addr) => println!("Allocated {} bytes at 0x{:X} ({})", size, addr.as_u64(), prot_str),
+            Err(e) => println!("Allocation error: {e}"),
+        }
+        Ok(())
+    }
+
+    fn cmd_free(&self, addr_str: &str) -> anyhow::Result<()> {
+        let addr = match parse_hex_or_dec(addr_str).map(Address::new) {
+            Some(a) => a,
+            None => {
+                println!("Invalid address: '{addr_str}'");
+                return Ok(());
+            }
+        };
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <pid>' first.");
+            return Ok(());
+        }
+        match self.pal.free_memory(addr) {
+            Ok(()) => println!("Freed memory at 0x{:X}", addr.as_u64()),
+            Err(e) => println!("Free error: {e}"),
+        }
         Ok(())
     }
 }

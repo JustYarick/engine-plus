@@ -177,11 +177,16 @@ mod tests {
         let resp = server.handle_request(req).expect("should return response");
         let result = resp.result.expect("should have result");
         let tools = result["tools"].as_array().expect("tools array");
-        assert!(tools.len() >= 10);
+        assert!(tools.len() >= 15);
         assert!(tools.iter().any(|t| t["name"] == "process_list"));
         assert!(tools.iter().any(|t| t["name"] == "memory_scan"));
         assert!(tools.iter().any(|t| t["name"] == "disassemble"));
         assert!(tools.iter().any(|t| t["name"] == "script_execute"));
+        assert!(tools.iter().any(|t| t["name"] == "assemble"));
+        assert!(tools.iter().any(|t| t["name"] == "code_patch"));
+        assert!(tools.iter().any(|t| t["name"] == "hook_install"));
+        assert!(tools.iter().any(|t| t["name"] == "pattern_generate"));
+        assert!(tools.iter().any(|t| t["name"] == "find_xrefs"));
     }
 
     #[test]
@@ -227,6 +232,31 @@ mod tests {
         assert_eq!(result["isError"], false);
         let text = result["content"][0]["text"].as_str().expect("text string");
         assert!(text.contains("200"));
+    }
+
+    #[test]
+    fn test_mcp_tool_call_assemble() {
+        let server = McpServer::new();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(6)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "assemble",
+                "arguments": {
+                    "code": "xor eax, eax\nret",
+                    "ip": "0x1000",
+                    "bitness": 64
+                }
+            })),
+        };
+
+        let resp = server.handle_request(req).expect("should return response");
+        let result = resp.result.expect("should have result");
+        assert_eq!(result["isError"], false);
+        let text = result["content"][0]["text"].as_str().expect("text string");
+        assert!(text.contains("hex"));
+        assert!(text.contains("C3"));
     }
 
     #[test]

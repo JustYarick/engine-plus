@@ -63,7 +63,7 @@ clap = { version = "4.5", features = ["derive"] }
 mlua = { version = "0.9", features = ["lua54", "vendored", "async"] }
 
 # Disassembly & Architecture
-iced-x86 = { version = "1.21", features = ["std", "decoder", "intel", "gas", "masm", "nasm"] }
+iced-x86 = { version = "1.21", features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "intel", "gas", "masm", "nasm"] }
 
 [profile.release]
 opt-level = 3
