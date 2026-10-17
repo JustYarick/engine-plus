@@ -2,7 +2,6 @@ pub mod error;
 pub mod traits;
 pub mod types;
 
-#[cfg(target_os = "linux")]
 pub mod os;
 
 pub use error::{PalError, PalResult};
@@ -18,7 +17,11 @@ pub fn default_backend() -> Box<dyn ProcessAccessLayer> {
     {
         Box::new(os::linux::ProcessVmBackend::new())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(os::windows::WinApiBackend::new())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         panic!("Platform currently not supported");
     }
@@ -30,7 +33,11 @@ pub fn default_enumerator() -> Box<dyn ProcessEnumerator> {
     {
         Box::new(os::linux::LinuxProcessEnumerator)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(os::windows::WindowsProcessEnumerator)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         panic!("Platform currently not supported");
     }

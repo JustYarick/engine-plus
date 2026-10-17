@@ -17,4 +17,4 @@ libc.workspace = true
 nix.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# windows-sys will be added when implementing windows backend
+windows-sys.workspace = true

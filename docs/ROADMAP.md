@@ -93,16 +93,23 @@ flowchart TD
 ## Этап 4. Кроссплатформенность: Windows PAL (День 15–18)
 **Цель:** Обеспечить идентичную работу сканера и движка на Windows.
 
-- [ ] **4.1. Реализация Windows PAL под `#[cfg(target_os = "windows")]`:**
-  - Использование `windows-sys` или `windows` крейта.
-  - Перечисление процессов через `CreateToolhelp32Snapshot`.
-  - Получение списка модулей (`EnumProcessModulesEx`).
-  - Карта памяти через `VirtualQueryEx`.
-  - Чтение/запись памяти через `OpenProcess` + `ReadProcessMemory` / `WriteProcessMemory`.
-- [ ] **4.2. Поддержка Proton / Wine:**
-  - Добавление логики сопоставления Windows PE модулей с путями внутри Wine на Linux.
+- [x] **4.1. Реализация Windows PAL под `#[cfg(target_os = "windows")]`:**
+  - Использование высокопроизводительного `windows-sys` 0.59.
+  - Потокобезопасный RAII wrapper `AutoHandle` (`Send + Sync`) с автоматическим `CloseHandle`.
+  - Перечисление процессов через `CreateToolhelp32Snapshot` (`TH32CS_SNAPPROCESS`) и `Process32FirstW` / `Process32NextW`.
+  - Перечисление модулей через `CreateToolhelp32Snapshot` (`TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32`) и `Module32FirstW` / `Module32NextW`.
+  - Карта памяти через `VirtualQueryEx` с сопоставлением битовых флагов `Protect` в `ProtectionFlags`.
+  - Чтение и запись памяти через `OpenProcess` (с fallback на `PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION`) + `ReadProcessMemory` / `WriteProcessMemory`.
+  - Выделение и освобождение памяти через `VirtualAllocEx` и `VirtualFreeEx`.
+  - Проверено компилятором под целевую платформу `x86_64-pc-windows-gnu` без предупреждений и ошибок.
+- [x] **4.2. Поддержка Proton / Wine:**
+  - Определение процессов Wine / Proton через имя и командную строку (`is_wine_process`).
+  - Определение префикса Steam Proton / Wine (`find_proton_prefix`).
+  - Сопоставление DOS-путей (`C:\...`, `Z:\...`) с путями файловой системы Linux хоста (`map_wine_dos_path`).
+  - Собственный парсер заголовков и секций Windows PE/PE32+ (`parse_pe_headers`) с вычислением RVA, ImageBase и флагов доступа секций.
+  - Поиск базы модулей Windows в виртуальной памяти процессов под Wine (`find_wine_module_base`).
 
-**Результат:** Engine+ без изменения кода работает и на Linux, и на Windows.
+**Результат:** Engine+ без изменения кода работает и на Linux, и на Windows, а также бесшовно поддерживает игры под Proton/Wine.
 
 ---
 
