@@ -34,13 +34,31 @@ impl Address {
     }
 
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn add(self, bytes: usize) -> Self {
         Address(self.0.wrapping_add(bytes as u64))
     }
 
     #[inline]
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(self, bytes: usize) -> Self {
         Address(self.0.wrapping_sub(bytes as u64))
+    }
+}
+
+impl std::ops::Add<usize> for Address {
+    type Output = Address;
+    #[inline]
+    fn add(self, rhs: usize) -> Self::Output {
+        Address(self.0.wrapping_add(rhs as u64))
+    }
+}
+
+impl std::ops::Sub<usize> for Address {
+    type Output = Address;
+    #[inline]
+    fn sub(self, rhs: usize) -> Self::Output {
+        Address(self.0.wrapping_sub(rhs as u64))
     }
 }
 
@@ -100,7 +118,7 @@ pub struct MemoryRegion {
 impl MemoryRegion {
     pub fn new(start: u64, end: u64, protection: ProtectionFlags, path: Option<String>) -> Self {
         let size = (end.saturating_sub(start)) as usize;
-        let is_anonymous = path.as_ref().map_or(true, |p| p.is_empty() || p.starts_with('['));
+        let is_anonymous = path.as_ref().is_none_or(|p| p.is_empty() || p.starts_with('['));
         MemoryRegion {
             start: Address(start),
             end: Address(end),

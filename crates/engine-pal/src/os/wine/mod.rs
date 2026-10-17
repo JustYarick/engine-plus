@@ -62,11 +62,11 @@ pub fn map_wine_dos_path(dos_path: &str, wine_prefix: &Path) -> Option<PathBuf> 
 
     if let Some(stripped) = trimmed.strip_prefix("C:/").or_else(|| trimmed.strip_prefix("c:/")) {
         Some(wine_prefix.join("drive_c").join(stripped))
-    } else if let Some(stripped) = trimmed.strip_prefix("Z:/").or_else(|| trimmed.strip_prefix("z:/")) {
-        // Z: is typically mapped to root "/" on Linux Wine
-        Some(PathBuf::from("/").join(stripped))
     } else {
-        None
+        trimmed
+            .strip_prefix("Z:/")
+            .or_else(|| trimmed.strip_prefix("z:/"))
+            .map(|stripped| PathBuf::from("/").join(stripped))
     }
 }
 

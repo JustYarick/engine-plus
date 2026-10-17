@@ -229,7 +229,7 @@ pub fn dispatch_tool_call(
                             p.name.to_lowercase().contains(&f_lower)
                                 || p.cmdline
                                     .as_ref()
-                                    .map_or(false, |c| c.to_lowercase().contains(&f_lower))
+                                    .is_some_and(|c| c.to_lowercase().contains(&f_lower))
                         });
                     }
                     CallToolResult::json(&procs).unwrap_or_else(|e| CallToolResult::error(e.to_string()))

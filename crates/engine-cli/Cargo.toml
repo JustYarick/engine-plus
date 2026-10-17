@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "engine-plus-cli"
+name = "engine-plus"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,3 +19,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
+iced-x86.workspace = true

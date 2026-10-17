@@ -17,8 +17,8 @@ crates/
 ├── engine-core      # High-performance parallel memory scanning engine (Rayon, AOB, ScanValue, pagination)
 ├── engine-script    # Sandboxed scripting environment (Pure Lua 5.4, zero OS/IO access)
 ├── engine-mcp       # Standard Model Context Protocol (MCP) server for AI reverse-engineering
-├── engine-gui       # VS Code/IDE-style desktop GUI (egui, egui_dock, Catppuccin Mocha theme)
-└── engine-cli       # Headless CLI & MCP stdio launcher
+└── engine-cli       # Primary binary ('engine-plus'): Interactive REPL, subcommands & MCP server
+# (engine-gui is postponed per user decision; focus is on Console & MCP)
 ```
 
 ### Supported Platforms

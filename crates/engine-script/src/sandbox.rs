@@ -27,8 +27,8 @@ pub fn create_sandboxed_lua() -> ScriptResult<Lua> {
 /// Helper to verify if the sandboxed Lua environment blocks unsafe access
 pub fn verify_sandbox(lua: &Lua) -> bool {
     let globals = lua.globals();
-    let has_os = globals.get::<_, Value>("os").map_or(false, |v| !v.is_nil());
-    let has_io = globals.get::<_, Value>("io").map_or(false, |v| !v.is_nil());
+    let has_os = globals.get::<_, Value>("os").is_ok_and(|v| !v.is_nil());
+    let has_io = globals.get::<_, Value>("io").is_ok_and(|v| !v.is_nil());
     !has_os && !has_io
 }
 
