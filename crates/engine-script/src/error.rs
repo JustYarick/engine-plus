@@ -8,6 +8,12 @@ pub enum ScriptError {
     #[error("Core engine error: {0}")]
     Core(#[from] engine_core::CoreError),
 
+    #[error("PAL error: {0}")]
+    Pal(#[from] engine_pal::PalError),
+
+    #[error("AutoAssembler error: {0}")]
+    AutoAssemble(#[from] crate::auto_assembler::AutoAssembleError),
+
     #[error("Security violation: {0}")]
     Security(String),
 

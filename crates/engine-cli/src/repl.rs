@@ -12,6 +12,7 @@ pub struct InteractiveConsole {
     attached_pid: Option<ProcessId>,
     attached_name: Option<String>,
     current_scan_type: ScanValueType,
+    allocations: std::collections::HashMap<String, Address>,
 }
 
 impl InteractiveConsole {
@@ -22,6 +23,7 @@ impl InteractiveConsole {
             attached_pid: None,
             attached_name: None,
             current_scan_type: ScanValueType::I32,
+            allocations: std::collections::HashMap::new(),
         }
     }
 
@@ -256,6 +258,21 @@ impl InteractiveConsole {
                         self.cmd_export_struct(addr_str, size, lang, name)?;
                     }
                 }
+                "aa" | "autoassemble" => {
+                    if args.is_empty() {
+                        println!("Usage: aa <script_or_file> [disable]");
+                        println!("  Example: aa \"[ENABLE]; alloc(mycave, 1024); mycave: nop; ret\"");
+                    } else {
+                        let script_arg = args[0];
+                        let script = if std::path::Path::new(script_arg).exists() {
+                            std::fs::read_to_string(script_arg)?
+                        } else {
+                            args.join(" ")
+                        };
+                        let enable = !args.iter().any(|&s| s.eq_ignore_ascii_case("disable"));
+                        self.cmd_aa(&script, enable)?;
+                    }
+                }
                 _ => {
                     println!("Unknown command: '{cmd}'. Type 'help' for available commands.");
                 }
@@ -287,6 +304,7 @@ impl InteractiveConsole {
         println!("  xrefs <target> <start> [sz] - Find cross-references (calls, jumps, loads) to target address");
         println!("  alloc <size> [prot]         - Allocate memory in target process (e.g. 'alloc 4096 rwx')");
         println!("  free <addr>                 - Free allocated memory in target process");
+        println!("  aa <script|file> [disable]  - Cheat Engine style AutoAssembler script ([ENABLE]/[DISABLE], alloc, labels)");
         println!("  lua <code>                  - Execute script in sandboxed Lua 5.4 environment");
         println!("  exit / quit                 - Quit interactive console\n");
     }
@@ -551,6 +569,28 @@ impl InteractiveConsole {
         }
         for i in &summary.integers {
             println!("  +{} [INT] i32: {}, u32: {}", i.offset, i.as_i32, i.as_u32);
+        }
+        Ok(())
+    }
+
+    fn cmd_aa(&mut self, script: &str, enable: bool) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            println!("Error: Not attached to any process. Use 'attach <PID>' first.");
+            return Ok(());
+        }
+
+        let normalized = script.replace(';', "\n");
+        match engine_script::AutoAssembler::execute(&normalized, enable, &mut *self.pal, &mut self.allocations) {
+            Ok(report) => {
+                println!(
+                    "AutoAssembler executed successfully ({})",
+                    if enable { "ENABLED" } else { "DISABLED" }
+                );
+                for a in report.allocations {
+                    println!("  Allocated '{}' at 0x{:X} ({} bytes)", a.name, a.address.as_u64(), a.size);
+                }
+            }
+            Err(e) => println!("AutoAssembler error: {e}"),
         }
         Ok(())
     }

@@ -7,21 +7,39 @@ use engine_core::{
 use engine_pal::{
     default_backend, default_enumerator, Address, ProcessAccessLayer, ProcessId, ProtectionFlags,
 };
+use engine_script::{AutoAssembler, ScriptEngine};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Global state session for active process and scanning operations in MCP
 pub struct EngineSession {
-    pub pal: Box<dyn ProcessAccessLayer>,
-    pub scanner: MemoryScanner,
+    pub pal: Arc<Mutex<Box<dyn ProcessAccessLayer>>>,
+    pub scanner: Arc<Mutex<MemoryScanner>>,
+    pub script_engine: Arc<Mutex<ScriptEngine>>,
+    pub aa_allocations: Arc<Mutex<HashMap<String, Address>>>,
 }
 
 impl EngineSession {
     pub fn new() -> Self {
+        let pal: Arc<Mutex<Box<dyn ProcessAccessLayer>>> = Arc::new(Mutex::new(default_backend()));
+        let scanner = Arc::new(Mutex::new(MemoryScanner::new()));
+        let aa_allocations = Arc::new(Mutex::new(HashMap::new()));
+        let script_engine = Arc::new(Mutex::new(
+            ScriptEngine::with_allocations(
+                Arc::clone(&pal),
+                Arc::clone(&scanner),
+                Arc::clone(&aa_allocations),
+            )
+            .expect("Failed to initialize ScriptEngine"),
+        ));
+
         EngineSession {
-            pal: default_backend(),
-            scanner: MemoryScanner::new(),
+            pal,
+            scanner,
+            script_engine,
+            aa_allocations,
         }
     }
 }
@@ -162,13 +180,25 @@ pub fn list_tools() -> Vec<Tool> {
         },
         Tool {
             name: "script_execute".to_string(),
-            description: "Execute safe sandboxed Lua 5.4 script for automation, reverse engineering, or math".to_string(),
+            description: "Execute safe sandboxed Lua 5.4 script for automation, reverse engineering, or math. Has access to 'memory', 'scanner', and 'assembler' modules, and 'auto_assemble' function.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "code": { "type": "string", "description": "Lua script code to execute" }
                 },
                 "required": ["code"]
+            }),
+        },
+        Tool {
+            name: "auto_assemble".to_string(),
+            description: "Execute a Cheat Engine style AutoAssembler script with [ENABLE] / [DISABLE] sections, alloc(name, size), dealloc(name), labels, and assembly instructions/patches".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "script": { "type": "string", "description": "AutoAssembler script content" },
+                    "enable": { "type": "boolean", "default": true, "description": "Execute [ENABLE] section (true) or [DISABLE] section (false)" }
+                },
+                "required": ["script"]
             }),
         },
         Tool {
@@ -363,6 +393,15 @@ pub fn dispatch_tool_call(
     args: Option<Value>,
 ) -> CallToolResult {
     let args = args.unwrap_or(json!({}));
+    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc) = {
+        let s = session_arc.lock().unwrap();
+        (
+            Arc::clone(&s.pal),
+            Arc::clone(&s.scanner),
+            Arc::clone(&s.script_engine),
+            Arc::clone(&s.aa_allocations),
+        )
+    };
 
     match name {
         "process_list" => {
@@ -390,38 +429,38 @@ pub fn dispatch_tool_call(
                 None => return CallToolResult::error("Missing required parameter 'pid'"),
             };
 
-            let mut session = session_arc.lock().unwrap();
-            match session.pal.attach(pid) {
+            let mut pal = pal_arc.lock().unwrap();
+            match pal.attach(pid) {
                 Ok(()) => {
-                    session.scanner.reset();
-                    let arch = match session.pal.architecture() {
+                    scanner_arc.lock().unwrap().reset();
+                    let arch = match pal.architecture() {
                         engine_pal::CpuArchitecture::X86_32 => "32-bit (x86)",
                         engine_pal::CpuArchitecture::X86_64 => "64-bit (x64)",
                     };
                     CallToolResult::text(format!(
                         "Successfully attached to process {pid} ({arch}) via backend '{}'",
-                        session.pal.backend_name()
+                        pal.backend_name()
                     ))
                 }
                 Err(e) => CallToolResult::error(format!("Failed to attach to process {pid}: {e}")),
             }
         }
         "process_info" => {
-            let session = session_arc.lock().unwrap();
-            let pid = match session.pal.attached_pid() {
+            let pal = pal_arc.lock().unwrap();
+            let pid = match pal.attached_pid() {
                 Some(p) => p,
                 None => return CallToolResult::error("Not attached to any process. Call process_attach first."),
             };
 
-            let regions_count = session.pal.query_regions().map(|r| r.len()).unwrap_or(0);
-            let modules = session.pal.enumerate_modules().unwrap_or_default();
-            let threads_count = session.pal.enumerate_threads().map(|t| t.len()).unwrap_or(0);
+            let regions_count = pal.query_regions().map(|r| r.len()).unwrap_or(0);
+            let modules = pal.enumerate_modules().unwrap_or_default();
+            let threads_count = pal.enumerate_threads().map(|t| t.len()).unwrap_or(0);
 
             let info = json!({
                 "pid": pid,
-                "backend": session.pal.backend_name(),
-                "architecture": format!("{:?}", session.pal.architecture()),
-                "stealth_level": format!("{:?}", session.pal.stealth_level()),
+                "backend": pal.backend_name(),
+                "architecture": format!("{:?}", pal.architecture()),
+                "stealth_level": format!("{:?}", pal.stealth_level()),
                 "mapped_regions_count": regions_count,
                 "threads_count": threads_count,
                 "loaded_modules_count": modules.len(),
@@ -461,13 +500,13 @@ pub fn dispatch_tool_call(
                 Err(e) => return CallToolResult::error(format!("Failed to parse value: {e}")),
             };
 
-            let session = &mut *session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("Not attached to any process. Call process_attach first.");
             }
 
-            let pal = &*session.pal;
-            let scanner = &mut session.scanner;
+            let pal_ref = &**pal;
+            let mut scanner = scanner_arc.lock().unwrap();
 
             let start = std::time::Instant::now();
             let count_res = if mode_str == "first_exact" {
@@ -475,7 +514,7 @@ pub fn dispatch_tool_call(
                 if let Some(a) = args.get("alignment").and_then(|v| v.as_u64()) {
                     config.alignment = a as usize;
                 }
-                scanner.first_scan(pal, &config, &FirstScanMode::Exact(parsed_val))
+                scanner.first_scan(pal_ref, &config, &FirstScanMode::Exact(parsed_val))
             } else {
                 let next_mode = match mode_str {
                     "next_exact" => NextScanMode::Exact(parsed_val),
@@ -485,7 +524,7 @@ pub fn dispatch_tool_call(
                     "next_decreased" => NextScanMode::Decreased,
                     _ => return CallToolResult::error(format!("Unsupported scan_mode '{mode_str}'")),
                 };
-                scanner.next_scan(pal, &next_mode)
+                scanner.next_scan(pal_ref, &next_mode)
             };
 
             let duration = start.elapsed();
@@ -519,12 +558,12 @@ pub fn dispatch_tool_call(
             let type_str = args.get("val_type").and_then(|v| v.as_str()).unwrap_or("i32");
             let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("Not attached to any process. Call process_attach first.");
             }
 
-            match session.pal.read_raw(addr, size) {
+            match pal.read_raw(addr, size) {
                 Ok(bytes) => {
                     let val = match type_str {
                         "i32" if bytes.len() >= 4 => json!(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
@@ -592,12 +631,12 @@ pub fn dispatch_tool_call(
                 _ => return CallToolResult::error(format!("Unsupported type '{type_str}' for write")),
             };
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("Not attached to any process. Call process_attach first.");
             }
 
-            match session.pal.write_raw(addr, &bytes_to_write) {
+            match pal.write_raw(addr, &bytes_to_write) {
                 Ok(()) => CallToolResult::text(format!(
                     "Successfully wrote {} bytes to address 0x{:X}",
                     bytes_to_write.len(),
@@ -617,13 +656,13 @@ pub fn dispatch_tool_call(
             };
             let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("Not attached to any process. Call process_attach first.");
             }
 
-            let regions = session.pal.query_regions().unwrap_or_default();
-            match session.pal.read_raw(addr, size) {
+            let regions = pal.query_regions().unwrap_or_default();
+            match pal.read_raw(addr, size) {
                 Ok(bytes) => {
                     let summary = analyze_memory_block(addr, &bytes, &regions);
                     CallToolResult::json(&summary).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
@@ -632,19 +671,19 @@ pub fn dispatch_tool_call(
             }
         }
         "process_detach" => {
-            let mut session = session_arc.lock().unwrap();
-            match session.pal.detach() {
+            let mut pal = pal_arc.lock().unwrap();
+            match pal.detach() {
                 Ok(()) => CallToolResult::text("Successfully detached from process"),
                 Err(e) => CallToolResult::error(format!("Failed to detach: {e}")),
             }
         }
         "memory_regions" => {
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("Not attached to any process. Call process_attach first.");
             }
             let writable_only = args.get("writable_only").and_then(|v| v.as_bool()).unwrap_or(false);
-            match session.pal.query_regions() {
+            match pal.query_regions() {
                 Ok(mut regs) => {
                     if writable_only {
                         regs.retain(|r| r.is_writable());
@@ -699,25 +738,51 @@ pub fn dispatch_tool_call(
                 None => return CallToolResult::error("Missing parameter 'code'"),
             };
 
-            match engine_script::sandbox::create_sandboxed_lua() {
-                Ok(lua) => {
-                    match lua.load(code).eval::<engine_script::mlua::Value>() {
-                        Ok(val) => {
-                            let val_str = match val {
-                                engine_script::mlua::Value::Nil => "nil".to_string(),
-                                engine_script::mlua::Value::Boolean(b) => b.to_string(),
-                                engine_script::mlua::Value::Integer(i) => i.to_string(),
-                                engine_script::mlua::Value::Number(n) => n.to_string(),
-                                engine_script::mlua::Value::String(s) => s.to_str().unwrap_or("").to_string(),
-                                engine_script::mlua::Value::Table(_) => "[table]".to_string(),
-                                other => format!("{:?}", other),
-                            };
-                            CallToolResult::text(val_str)
-                        }
-                        Err(e) => CallToolResult::error(format!("Lua execution error: {e}")),
-                    }
+            let script_engine = script_engine_arc.lock().unwrap();
+            let result = match script_engine.execute(code) {
+                Ok(val) => {
+                    let val_str = match val {
+                        engine_script::mlua::Value::Nil => "nil".to_string(),
+                        engine_script::mlua::Value::Boolean(b) => b.to_string(),
+                        engine_script::mlua::Value::Integer(i) => i.to_string(),
+                        engine_script::mlua::Value::Number(n) => n.to_string(),
+                        engine_script::mlua::Value::String(s) => s.to_str().unwrap_or("").to_string(),
+                        engine_script::mlua::Value::Table(_) => "[table]".to_string(),
+                        other => format!("{:?}", other),
+                    };
+                    CallToolResult::text(val_str)
                 }
-                Err(e) => CallToolResult::error(format!("Failed to initialize Lua sandbox: {e}")),
+                Err(e) => CallToolResult::error(format!("Lua execution error: {e}")),
+            };
+            result
+        }
+        "auto_assemble" => {
+            let script = match args.get("script").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return CallToolResult::error("Missing parameter 'script'"),
+            };
+            let enable = args.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+
+            let mut pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("Not attached to any process. Call process_attach first.");
+            }
+
+            let mut allocs = aa_allocs_arc.lock().unwrap();
+            match AutoAssembler::execute(script, enable, &mut **pal, &mut allocs) {
+                Ok(report) => {
+                    let resp = json!({
+                        "status": if enable { "enabled" } else { "disabled" },
+                        "allocations": report.allocations.iter().map(|a| json!({
+                            "name": a.name,
+                            "address": format!("0x{:X}", a.address.as_u64()),
+                            "size": a.size
+                        })).collect::<Vec<_>>(),
+                        "total_allocations": allocs.len(),
+                    });
+                    CallToolResult::json(&resp).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+                Err(e) => CallToolResult::error(format!("AutoAssembler error: {e}")),
             }
         }
         "file_analyze_binary" => {
@@ -826,11 +891,11 @@ pub fn dispatch_tool_call(
                 None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
             };
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
-            let bitness = match session.pal.architecture() {
+            let bitness = match pal.architecture() {
                 engine_pal::CpuArchitecture::X86_32 => 32,
                 engine_pal::CpuArchitecture::X86_64 => 64,
             };
@@ -860,12 +925,12 @@ pub fn dispatch_tool_call(
                 return CallToolResult::error("Patch bytes are empty");
             }
 
-            let original_bytes = match session.pal.read_raw(address, patch_bytes.len()) {
+            let original_bytes = match pal.read_raw(address, patch_bytes.len()) {
                 Ok(b) => b,
                 Err(e) => return CallToolResult::error(format!("Failed to read original bytes: {e}")),
             };
 
-            match session.pal.write_raw(address, &patch_bytes) {
+            match pal.write_raw(address, &patch_bytes) {
                 Ok(()) => {
                     let orig_hex = original_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
                     let patch_hex = patch_bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
@@ -900,16 +965,16 @@ pub fn dispatch_tool_call(
                 None => return CallToolResult::error(format!("Invalid cave_address: '{cave_str}'")),
             };
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
-            let bitness = match session.pal.architecture() {
+            let bitness = match pal.architecture() {
                 engine_pal::CpuArchitecture::X86_32 => 32,
                 engine_pal::CpuArchitecture::X86_64 => 64,
             };
 
-            let original_slice = match session.pal.read_raw(target_addr, 32) {
+            let original_slice = match pal.read_raw(target_addr, 32) {
                 Ok(b) => b,
                 Err(e) => return CallToolResult::error(format!("Failed to read target instructions: {e}")),
             };
@@ -935,10 +1000,10 @@ pub fn dispatch_tool_call(
                 &payload,
             ) {
                 Ok(package) => {
-                    if let Err(e) = session.pal.write_raw(cave_addr, &package.code_cave_bytes) {
+                    if let Err(e) = pal.write_raw(cave_addr, &package.code_cave_bytes) {
                         return CallToolResult::error(format!("Failed to write code cave bytes: {e}"));
                     }
-                    if let Err(e) = session.pal.write_raw(target_addr, &package.patch_bytes) {
+                    if let Err(e) = pal.write_raw(target_addr, &package.patch_bytes) {
                         return CallToolResult::error(format!("Failed to write detour patch: {e}"));
                     }
 
@@ -972,18 +1037,18 @@ pub fn dispatch_tool_call(
             };
             let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(32).min(128) as usize;
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
             let bitness = args.get("bitness").and_then(|v| v.as_u64()).map(|b| b as u32).unwrap_or_else(|| {
-                match session.pal.architecture() {
+                match pal.architecture() {
                     engine_pal::CpuArchitecture::X86_32 => 32,
                     engine_pal::CpuArchitecture::X86_64 => 64,
                 }
             });
 
-            let code_bytes = match session.pal.read_raw(address, size) {
+            let code_bytes = match pal.read_raw(address, size) {
                 Ok(b) => b,
                 Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
             };
@@ -1027,18 +1092,18 @@ pub fn dispatch_tool_call(
                 None => return CallToolResult::error("Missing parameter 'search_size'"),
             };
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
             let bitness = args.get("bitness").and_then(|v| v.as_u64()).map(|b| b as u32).unwrap_or_else(|| {
-                match session.pal.architecture() {
+                match pal.architecture() {
                     engine_pal::CpuArchitecture::X86_32 => 32,
                     engine_pal::CpuArchitecture::X86_64 => 64,
                 }
             });
 
-            let code_bytes = match session.pal.read_raw(start_addr, search_size) {
+            let code_bytes = match pal.read_raw(start_addr, search_size) {
                 Ok(b) => b,
                 Err(e) => return CallToolResult::error(format!("Failed to read memory at search_start: {e}")),
             };
@@ -1062,12 +1127,12 @@ pub fn dispatch_tool_call(
                 _ => ProtectionFlags::RWX,
             };
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
 
-            match session.pal.allocate_memory(size, protection) {
+            match pal.allocate_memory(size, protection) {
                 Ok(addr) => CallToolResult::json(&json!({
                     "status": "success",
                     "address": format!("0x{:X}", addr.as_u64()),
@@ -1088,12 +1153,12 @@ pub fn dispatch_tool_call(
                 None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
             };
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
 
-            match session.pal.free_memory(address) {
+            match pal.free_memory(address) {
                 Ok(()) => CallToolResult::json(&json!({
                     "status": "freed",
                     "address": format!("0x{:X}", address.as_u64())
@@ -1114,16 +1179,16 @@ pub fn dispatch_tool_call(
             let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(128).min(1024) as usize;
             let class_name = args.get("class_name").and_then(|v| v.as_str()).unwrap_or("ReconstructedClass");
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
 
-            let bytes = match session.pal.read_raw(address, size) {
+            let bytes = match pal.read_raw(address, size) {
                 Ok(b) => b,
                 Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
             };
-            let regions = session.pal.query_regions().unwrap_or_default();
+            let regions = pal.query_regions().unwrap_or_default();
             let structure = ClassStructure::reconstruct(address, &bytes, &regions, Some(class_name));
 
             CallToolResult::json(&structure).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
@@ -1141,16 +1206,16 @@ pub fn dispatch_tool_call(
             let lang = args.get("language").and_then(|v| v.as_str()).unwrap_or("cpp");
             let class_name = args.get("class_name").and_then(|v| v.as_str()).unwrap_or("ReconstructedClass");
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
 
-            let bytes = match session.pal.read_raw(address, size) {
+            let bytes = match pal.read_raw(address, size) {
                 Ok(b) => b,
                 Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
             };
-            let regions = session.pal.query_regions().unwrap_or_default();
+            let regions = pal.query_regions().unwrap_or_default();
             let structure = ClassStructure::reconstruct(address, &bytes, &regions, Some(class_name));
 
             let code = match lang.to_lowercase().as_str() {
@@ -1187,16 +1252,16 @@ pub fn dispatch_tool_call(
                 None => return CallToolResult::error("Missing parameter 'new_name'"),
             };
 
-            let session = session_arc.lock().unwrap();
-            if !session.pal.is_attached() {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
             }
 
-            let bytes = match session.pal.read_raw(address, size) {
+            let bytes = match pal.read_raw(address, size) {
                 Ok(b) => b,
                 Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
             };
-            let regions = session.pal.query_regions().unwrap_or_default();
+            let regions = pal.query_regions().unwrap_or_default();
             let mut structure = ClassStructure::reconstruct(address, &bytes, &regions, Some(class_name));
 
             match structure.rename_field(offset, new_name) {

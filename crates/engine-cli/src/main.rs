@@ -136,6 +136,10 @@ enum Commands {
 
     /// Execute script in safe sandboxed Lua 5.4 environment
     Script {
+        /// Optional PID to attach and bind to memory/scanner APIs
+        #[arg(short, long)]
+        pid: Option<ProcessId>,
+
         /// Direct Lua code to execute
         #[arg(short = 'c', long)]
         code: Option<String>,
@@ -143,6 +147,24 @@ enum Commands {
         /// Path to Lua script file
         #[arg(short, long)]
         file: Option<PathBuf>,
+    },
+
+    /// Execute Cheat Engine style AutoAssembler script ([ENABLE] / [DISABLE], alloc, labels, patches)
+    Aa {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        /// Script string (lines separated by newlines or ';')
+        #[arg(short, long)]
+        script: Option<String>,
+
+        /// Path to AutoAssembler script file (.cea, .txt)
+        #[arg(short, long)]
+        file: Option<PathBuf>,
+
+        /// Execute [DISABLE] section instead of [ENABLE]
+        #[arg(long)]
+        disable: bool,
     },
 
     /// Assemble x86/x64 instructions into machine code bytes
@@ -549,16 +571,24 @@ async fn main() -> anyhow::Result<()> {
                 print!("{asm}");
             }
         },
-        Some(Commands::Script { code, file }) => {
+        Some(Commands::Script { pid, code, file }) => {
             let script_code = match (code, file) {
                 (Some(c), _) => c,
                 (None, Some(f)) => std::fs::read_to_string(f)?,
                 (None, None) => anyhow::bail!("Provide Lua code via -c <code> or script file via --file <path>"),
             };
 
-            let lua = engine_script::sandbox::create_sandboxed_lua()
-                .map_err(|e| anyhow::anyhow!("Failed to initialize Lua sandbox: {e}"))?;
-            let val = lua.load(&script_code).eval::<engine_script::mlua::Value>()
+            let mut pal = default_backend();
+            if let Some(target_pid) = pid {
+                pal.attach(target_pid)?;
+            }
+            let pal_arc: std::sync::Arc<std::sync::Mutex<Box<dyn engine_pal::ProcessAccessLayer>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(pal));
+            let scanner_arc = std::sync::Arc::new(std::sync::Mutex::new(MemoryScanner::new()));
+            let engine = engine_script::ScriptEngine::new(pal_arc, scanner_arc)
+                .map_err(|e| anyhow::anyhow!("Failed to initialize ScriptEngine: {e}"))?;
+
+            let val = engine.execute(&script_code)
                 .map_err(|e| anyhow::anyhow!("Lua error: {e}"))?;
             let val_str = match val {
                 engine_script::mlua::Value::Nil => "nil".to_string(),
@@ -570,6 +600,29 @@ async fn main() -> anyhow::Result<()> {
                 other => format!("{:?}", other),
             };
             println!("{val_str}");
+        }
+        Some(Commands::Aa { pid, script, file, disable }) => {
+            let script_code = match (script, file) {
+                (Some(s), _) => s.replace(';', "\n"),
+                (None, Some(f)) => std::fs::read_to_string(f)?,
+                (None, None) => anyhow::bail!("Provide AutoAssembler script via -s <script> or file via --file <path>"),
+            };
+
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let mut allocs = std::collections::HashMap::new();
+
+            let enable = !disable;
+            let report = engine_script::AutoAssembler::execute(&script_code, enable, &mut *pal, &mut allocs)
+                .map_err(|e| anyhow::anyhow!("AutoAssembler error: {e}"))?;
+
+            println!("AutoAssembler executed successfully ({})", if enable { "ENABLED" } else { "DISABLED" });
+            if !report.allocations.is_empty() {
+                println!("  Allocations ({}):", report.allocations.len());
+                for a in report.allocations {
+                    println!("    - {}: 0x{:X} ({} bytes)", a.name, a.address.as_u64(), a.size);
+                }
+            }
         }
         Some(Commands::Assemble { code, ip, bitness }) => {
             let addr = parse_hex_or_dec_val(&ip)

@@ -177,11 +177,12 @@ mod tests {
         let resp = server.handle_request(req).expect("should return response");
         let result = resp.result.expect("should have result");
         let tools = result["tools"].as_array().expect("tools array");
-        assert!(tools.len() >= 18);
+        assert!(tools.len() >= 19);
         assert!(tools.iter().any(|t| t["name"] == "process_list"));
         assert!(tools.iter().any(|t| t["name"] == "memory_scan"));
         assert!(tools.iter().any(|t| t["name"] == "disassemble"));
         assert!(tools.iter().any(|t| t["name"] == "script_execute"));
+        assert!(tools.iter().any(|t| t["name"] == "auto_assemble"));
         assert!(tools.iter().any(|t| t["name"] == "assemble"));
         assert!(tools.iter().any(|t| t["name"] == "code_patch"));
         assert!(tools.iter().any(|t| t["name"] == "hook_install"));
@@ -225,7 +226,7 @@ mod tests {
             params: Some(json!({
                 "name": "script_execute",
                 "arguments": {
-                    "code": "return 50 * 4"
+                    "code": "return type(memory) .. ' ' .. type(scanner) .. ' ' .. type(assembler) .. ' ' .. type(auto_assemble)"
                 }
             })),
         };
@@ -234,7 +235,29 @@ mod tests {
         let result = resp.result.expect("should have result");
         assert_eq!(result["isError"], false);
         let text = result["content"][0]["text"].as_str().expect("text string");
-        assert!(text.contains("200"));
+        assert_eq!(text, "table table table function");
+    }
+
+    #[test]
+    fn test_mcp_tool_call_auto_assemble_unattached() {
+        let server = McpServer::new();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(7)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "auto_assemble",
+                "arguments": {
+                    "script": "[ENABLE]\n0x1000:\nnop\n"
+                }
+            })),
+        };
+
+        let resp = server.handle_request(req).expect("should return response");
+        let result = resp.result.expect("should have result");
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().expect("text string");
+        assert!(text.contains("Not attached to any process"));
     }
 
     #[test]

@@ -60,7 +60,7 @@ windows-sys = { version = "0.59", features = [
 clap = { version = "4.5", features = ["derive"] }
 
 # Scripting
-mlua = { version = "0.9", features = ["lua54", "vendored", "async"] }
+mlua = { version = "0.9", features = ["lua54", "vendored", "async", "send"] }
 
 # Disassembly & Architecture
 iced-x86 = { version = "1.21", features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "intel", "gas", "masm", "nasm"] }
