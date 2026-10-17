@@ -244,18 +244,26 @@ flowchart TD
 
 ---
 
-## Этап 12. Pointer Scanner и Speed Hack (День 79–86)
-**Цель:** Поиск статических указателей и управление скоростью игры.
+## Этап 12. Pointer Scanner и Speed Hack (Завершён ✅)
+**Цель:** Поиск статических цепочек указателей (Pointer Chains) и управление скоростью игрового процесса (Time Dilation).
 
-- [ ] **12.1. Многоуровневый Pointer Scanner:**
-  - Построение графа указателей в памяти процесса.
-  - Поиск цепочек `game.exe + Offset1 -> Offset2 -> Target Address`.
-  - Сохранение карты указателей и повторное сканирование после перезапуска игры.
-- [ ] **12.2. Speed Hack:**
-  - Перехват функций времени (`clock_gettime` на Linux, `QueryPerformanceCounter` / `GetTickCount` на Windows).
-  - Ползунок в GUI для замедления (0.1x) или ускорения (10x) игрового процесса.
+- [x] **12.1. Многоуровневый Pointer Scanner:**
+  - Генерация карты указателей процесса (`PointerMap`) с чанковым чтением памяти и валидацией целевых адресов.
+  - Высокоскоростной бинарный поиск указателей в диапазоне смещений через `partition_point` ($O(\log N)$).
+  - Построение графа и обратный поиск в глубину (DFS) цепочек `module + Offset1 -> Offset2 -> Target Address` с защитой от циклов (`HashSet<Address>`) и контролем глубины (1..=5).
+  - Модель цепочки [`PointerPath`](file:///home/yarick/my/myproject/engine_plus/crates/engine-core/src/pointer_scanner.rs) с динамическим разрешением в реальном времени (`resolve`) и проверкой валидности на каждом уровне.
+  - Фильтрация цепочек после перезапуска игры (`filter_paths`).
+- [x] **12.2. Непрерывный Speed Hack (Time Dilation Engine):**
+  - Машина состояний непрерывного масштабирования времени (`TimeDilationState`) с плавной сменой коэффициентов без временных скачков и рывков в игре.
+  - Генератор скриптов AutoAssembler (`SpeedHackScriptGenerator`) для перехвата системных таймеров высокого разрешения:
+    - Linux: перехват `clock_gettime` через Code Cave и масштабирование наносекунд.
+    - Windows: перехват `QueryPerformanceCounter` (QPC) и масштабирование тактов.
+- [x] **12.3. Интеграция в MCP Server и CLI REPL:**
+  - Новые MCP инструменты: `pointer_scan`, `pointer_resolve`, `speedhack_set`, `speedhack_generate_script`.
+  - Команды интерактивной консоли REPL: `ptrscan`, `ptrresolve`, `speedhack`, `speedscript`.
+  - Прямые CLI подкоманды: `engine-plus ptr-scan`, `engine-plus ptr-resolve`, `engine-plus speedhack`.
 
-**Результат:** Создание стабильных читов, не слетающих при перезапуске игры.
+**Результат:** Полная независимость от динамического размещения памяти (ASLR/динамические аллокации) благодаря авто-поиску статических цепочек указателей и мгновенное управление скоростью игрового процесса.
 
 ---
 

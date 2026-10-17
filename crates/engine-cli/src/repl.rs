@@ -1,6 +1,7 @@
 use engine_core::{
-    BreakpointManager, FirstScanMode, HitTracer, MemoryScanner, NextScanMode, ScanConfig,
-    ScanValue, ScanValueType,
+    BreakpointManager, FirstScanMode, HitTracer, MemoryScanner, NextScanMode, PointerMap,
+    PointerPath, PointerScanner, PointerScannerConfig, ScanConfig, ScanValue, ScanValueType,
+    SpeedHackScriptGenerator, TimeDilationState,
 };
 use engine_pal::{
     default_backend, default_enumerator, Address, BreakpointId, ProcessAccessLayer, ProcessId,
@@ -19,6 +20,7 @@ pub struct InteractiveConsole {
     attached_name: Option<String>,
     current_scan_type: ScanValueType,
     allocations: std::collections::HashMap<String, Address>,
+    time_dilation: TimeDilationState,
 }
 
 impl InteractiveConsole {
@@ -32,6 +34,7 @@ impl InteractiveConsole {
             attached_name: None,
             current_scan_type: ScanValueType::I32,
             allocations: std::collections::HashMap::new(),
+            time_dilation: TimeDilationState::default(),
         }
     }
 
@@ -329,6 +332,56 @@ impl InteractiveConsole {
                     let tid = args.first().and_then(|s| s.parse::<ProcessId>().ok());
                     self.cmd_step(tid)?;
                 }
+                "ptrscan" => {
+                    if args.is_empty() {
+                        println!("Usage: ptrscan <hex_target_address> [max_depth] [max_offset] [limit]");
+                        println!("  Example: ptrscan 0x7FFF123450 3 0x800 20");
+                    } else {
+                        let target_str = args[0];
+                        let max_depth = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(3);
+                        let max_offset = args.get(2).and_then(|s| parse_hex_or_dec(s)).unwrap_or(0x800) as usize;
+                        let limit = args.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+                        self.cmd_ptrscan(target_str, max_depth, max_offset, limit)?;
+                    }
+                }
+                "ptrresolve" => {
+                    if args.len() < 2 {
+                        println!("Usage: ptrresolve <module_name> <base_offset> [offsets...]");
+                        println!("  Example: ptrresolve game.exe 0x1000 0x20 0xF8");
+                    } else {
+                        let module = args[0];
+                        let base_offset = args[1];
+                        let offsets = &args[2..];
+                        self.cmd_ptrresolve(module, base_offset, offsets)?;
+                    }
+                }
+                "speedhack" | "speed" => {
+                    if args.is_empty() {
+                        let now_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos() as u64;
+                        let virt_time = self.time_dilation.calculate_virtual_time(now_ns);
+                        println!("Speed Hack status: {:.2}x (Real: {:.3}s, Virtual: {:.3}s)", self.time_dilation.multiplier, now_ns as f64 / 1_000_000_000.0, virt_time as f64 / 1_000_000_000.0);
+                        println!("Usage: speedhack <multiplier>");
+                        println!("  Example: speedhack 2.0");
+                    } else if let Ok(mult) = args[0].parse::<f64>() {
+                        self.cmd_speedhack(mult)?;
+                    } else {
+                        println!("Error: Invalid multiplier '{}'", args[0]);
+                    }
+                }
+                "speedscript" => {
+                    if args.is_empty() {
+                        println!("Usage: speedscript <multiplier> [linux|windows]");
+                        println!("  Example: speedscript 2.0 linux");
+                    } else if let Ok(mult) = args[0].parse::<f64>() {
+                        let platform = args.get(1).copied();
+                        self.cmd_speedhack_script(mult, platform)?;
+                    } else {
+                        println!("Error: Invalid multiplier '{}'", args[0]);
+                    }
+                }
                 _ => {
                     println!("Unknown command: '{cmd}'. Type 'help' for available commands.");
                 }
@@ -370,6 +423,10 @@ impl InteractiveConsole {
         println!("  pause                       - Pause/freeze target process execution (SIGSTOP)");
         println!("  resume                      - Resume target process execution (SIGCONT)");
         println!("  step [tid]                  - Advance single instruction (Single Step)");
+        println!("  ptrscan <addr> [dp] [off]   - Multi-level pointer scanner to find static module paths");
+        println!("  ptrresolve <mod> <off> [...] - Resolve multi-level pointer path to target address");
+        println!("  speedhack <multiplier>      - Time dilation speed hack multiplier (e.g. 'speedhack 2.0')");
+        println!("  speedscript <mult> [os]     - Generate AutoAssembler speed hack script (linux/windows)");
         println!("  exit / quit                 - Quit interactive console\n");
     }
 
@@ -1083,6 +1140,107 @@ impl InteractiveConsole {
         let regs = self.pal.single_step(tid)?;
         println!("Stepped to RIP: 0x{:016X}", regs.rip);
         println!("{}", regs.format_display());
+        Ok(())
+    }
+
+    fn cmd_ptrscan(&mut self, target_str: &str, max_depth: usize, max_offset: usize, limit: usize) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let target_val = parse_hex_or_dec(target_str)
+            .ok_or_else(|| anyhow::anyhow!("Invalid target address '{target_str}'"))?;
+        let target = Address::new(target_val);
+
+        println!("Building pointer map of target process readable memory...");
+        let regions = self.pal.query_regions()?;
+        let ptr_size = self.pal.architecture().pointer_size();
+        let pmap = PointerMap::build_from_memory(&*self.pal, &regions, ptr_size, ptr_size)?;
+        println!("Pointer map generated: {} pointers indexed across readable regions", pmap.total_pointers());
+
+        let modules = self.pal.enumerate_modules().unwrap_or_default();
+        println!("Scanning for pointer paths to 0x{:X} (Depth: 1..={}, Max Offset: 0x{:X})...", target.as_u64(), max_depth, max_offset);
+
+        let config = PointerScannerConfig {
+            max_depth,
+            max_offset,
+            max_results: limit.max(50),
+        };
+        let paths = PointerScanner::scan(&pmap, &modules, target, &config);
+        println!("Scan complete: Found {} pointer chain(s)", paths.len());
+
+        let display_count = paths.len().min(limit);
+        for (i, p) in paths.iter().take(display_count).enumerate() {
+            println!("  [#{}] {}", i + 1, p);
+        }
+        if paths.len() > limit {
+            println!("  ... and {} more path(s). Pass limit parameter to view more.", paths.len() - limit);
+        }
+        Ok(())
+    }
+
+    fn cmd_ptrresolve(&self, module: &str, base_offset_str: &str, offsets_strs: &[&str]) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let base_offset = parse_hex_or_dec(base_offset_str)
+            .ok_or_else(|| anyhow::anyhow!("Invalid base offset '{base_offset_str}'"))?;
+        let mut offsets = Vec::new();
+        for os in offsets_strs {
+            let off = parse_hex_or_dec(os)
+                .ok_or_else(|| anyhow::anyhow!("Invalid offset '{os}'"))? as i64;
+            offsets.push(off);
+        }
+
+        let modules = self.pal.enumerate_modules()?;
+        let target_mod = modules
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(module) || m.name.to_lowercase().contains(&module.to_lowercase()))
+            .ok_or_else(|| anyhow::anyhow!("Module '{module}' not found in target process"))?;
+
+        let path = PointerPath {
+            module_name: target_mod.name.clone(),
+            base_offset,
+            offsets,
+        };
+        let resolved = path.resolve(&*self.pal, target_mod.base_address, self.pal.architecture())?;
+        println!("Pointer Path: {}", path);
+        println!("  Module Base:      0x{:X}", target_mod.base_address.as_u64());
+        println!("  Resolved Address: 0x{:X}", resolved.as_u64());
+
+        if let Ok(bytes) = self.pal.read_raw(resolved, 8) {
+            let u32_val = u32::from_le_bytes(bytes[0..4].try_into().unwrap_or_default());
+            let i32_val = i32::from_le_bytes(bytes[0..4].try_into().unwrap_or_default());
+            let f32_val = f32::from_le_bytes(bytes[0..4].try_into().unwrap_or_default());
+            let u64_val = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default());
+            println!("  Value at target: i32 = {}, u32 = {}, f32 = {:.4}, u64 = 0x{:X}", i32_val, u32_val, f32_val, u64_val);
+        }
+        Ok(())
+    }
+
+    fn cmd_speedhack(&mut self, multiplier: f64) -> anyhow::Result<()> {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        self.time_dilation.set_multiplier(multiplier, now_ns);
+        let virt_time = self.time_dilation.calculate_virtual_time(now_ns);
+        println!("Speed Hack updated:");
+        println!("  Multiplier:   {:.2}x", self.time_dilation.multiplier);
+        println!("  Real Time:    {:.3} s", now_ns as f64 / 1_000_000_000.0);
+        println!("  Virtual Time: {:.3} s", virt_time as f64 / 1_000_000_000.0);
+        Ok(())
+    }
+
+    fn cmd_speedhack_script(&self, multiplier: f64, platform: Option<&str>) -> anyhow::Result<()> {
+        let script = match platform.map(|s| s.to_lowercase()).as_deref() {
+            Some("windows") | Some("win") => SpeedHackScriptGenerator::generate_windows_aa_script(multiplier),
+            _ => SpeedHackScriptGenerator::generate_linux_aa_script(multiplier),
+        };
+        println!("Generated AutoAssembler Speed Hack Script (Multiplier: {:.2}x):", multiplier);
+        println!("------------------------------------------------------------");
+        println!("{script}");
+        println!("------------------------------------------------------------");
+        println!("You can apply this script with: aa <paste_script>");
         Ok(())
     }
 }

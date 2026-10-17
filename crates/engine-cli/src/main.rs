@@ -319,6 +319,61 @@ enum Commands {
         #[arg(short, long, default_value = "4")]
         size: usize,
     },
+
+    /// Scan target process memory for multi-level static pointer chains
+    PtrScan {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        /// Target memory address to trace back (e.g. '0x7FFD1234')
+        #[arg(short, long)]
+        target: String,
+
+        /// Max pointer chain depth (1..=5, default: 3)
+        #[arg(short, long, default_value = "3")]
+        depth: usize,
+
+        /// Max offset from base pointer (default: 0x800)
+        #[arg(short, long, default_value = "0x800")]
+        max_offset: String,
+
+        /// Maximum results to display
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Resolve multi-level pointer path to actual target address
+    PtrResolve {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        /// Base module name (e.g. 'game.exe' or 'game.so')
+        #[arg(short, long)]
+        module: String,
+
+        /// Base offset from module base (e.g. '0x1000')
+        #[arg(short, long)]
+        base_offset: String,
+
+        /// Subsequent offsets in order (e.g. '0x20', '0xF8')
+        #[arg(short, long, num_args = 1..)]
+        offsets: Vec<String>,
+    },
+
+    /// Speed hack configuration or AutoAssembler injection script generator
+    Speedhack {
+        /// Speed multiplier (e.g. 2.0 for 2x speed, 0.5 for half speed)
+        #[arg(short, long, default_value = "1.0")]
+        multiplier: f64,
+
+        /// Generate AutoAssembler injection script instead of displaying time dilation state
+        #[arg(short, long)]
+        script: bool,
+
+        /// Target platform for script generation ('linux' or 'windows')
+        #[arg(long)]
+        platform: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -883,6 +938,103 @@ async fn main() -> anyhow::Result<()> {
                 other => anyhow::bail!("Unknown breakpoint type: '{other}'"),
             }
         }
+        Some(Commands::PtrScan { pid, target, depth, max_offset, limit }) => {
+            let target_addr = parse_hex_or_dec_val(&target)
+                .ok_or_else(|| anyhow::anyhow!("Invalid target address '{target}'"))?;
+            let max_off = parse_hex_or_dec_val(&max_offset)
+                .ok_or_else(|| anyhow::anyhow!("Invalid max_offset '{max_offset}'"))? as usize;
+
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+
+            println!("Building pointer map of target process (PID: {pid})...");
+            let regions = pal.query_regions()?;
+            let ptr_size = pal.architecture().pointer_size();
+            let pmap = engine_core::PointerMap::build_from_memory(&*pal, &regions, ptr_size, ptr_size)?;
+            println!("Indexed {} pointers across readable regions", pmap.total_pointers());
+
+            let modules = pal.enumerate_modules().unwrap_or_default();
+            println!("Scanning for pointer chains to 0x{:X} (Depth: 1..={}, Max Offset: 0x{:X})...", target_addr, depth, max_off);
+
+            let config = engine_core::PointerScannerConfig {
+                max_depth: depth,
+                max_offset: max_off,
+                max_results: limit.max(50),
+            };
+            let paths = engine_core::PointerScanner::scan(&pmap, &modules, Address::new(target_addr), &config);
+            println!("Scan complete: Found {} pointer chain(s)", paths.len());
+
+            let display_count = paths.len().min(limit);
+            for (i, p) in paths.iter().take(display_count).enumerate() {
+                println!("  [#{}] {}", i + 1, p);
+            }
+            if paths.len() > limit {
+                println!("  ... and {} more path(s). Pass --limit to view more.", paths.len() - limit);
+            }
+        }
+        Some(Commands::PtrResolve { pid, module, base_offset, offsets }) => {
+            let base_off = parse_hex_or_dec_val(&base_offset)
+                .ok_or_else(|| anyhow::anyhow!("Invalid base offset '{base_offset}'"))?;
+            let mut parsed_offsets = Vec::new();
+            for o in &offsets {
+                let off = parse_hex_or_dec_val(o)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid offset '{o}'"))? as i64;
+                parsed_offsets.push(off);
+            }
+
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+
+            let modules = pal.enumerate_modules()?;
+            let target_mod = modules
+                .iter()
+                .find(|m| m.name.eq_ignore_ascii_case(&module) || m.name.to_lowercase().contains(&module.to_lowercase()))
+                .ok_or_else(|| anyhow::anyhow!("Module '{module}' not found in target process"))?;
+
+            let path = engine_core::PointerPath {
+                module_name: target_mod.name.clone(),
+                base_offset: base_off,
+                offsets: parsed_offsets,
+            };
+            let resolved = path.resolve(&*pal, target_mod.base_address, pal.architecture())?;
+            println!("Pointer Path: {}", path);
+            println!("  Module Base:      0x{:X}", target_mod.base_address.as_u64());
+            println!("  Resolved Address: 0x{:X}", resolved.as_u64());
+
+            if let Ok(bytes) = pal.read_raw(resolved, 8) {
+                let u32_val = u32::from_le_bytes(bytes[0..4].try_into().unwrap_or_default());
+                let i32_val = i32::from_le_bytes(bytes[0..4].try_into().unwrap_or_default());
+                let f32_val = f32::from_le_bytes(bytes[0..4].try_into().unwrap_or_default());
+                let u64_val = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or_default());
+                println!("  Value at target: i32 = {}, u32 = {}, f32 = {:.4}, u64 = 0x{:X}", i32_val, u32_val, f32_val, u64_val);
+            }
+        }
+        Some(Commands::Speedhack { multiplier, script, platform }) => {
+            if script {
+                let script_code = match platform.as_deref().map(|s| s.to_lowercase()) {
+                    Some(ref p) if p == "windows" || p == "win" => {
+                        engine_core::SpeedHackScriptGenerator::generate_windows_aa_script(multiplier)
+                    }
+                    _ => engine_core::SpeedHackScriptGenerator::generate_linux_aa_script(multiplier),
+                };
+                println!("Generated AutoAssembler Speed Hack Script (Multiplier: {:.2}x):", multiplier);
+                println!("------------------------------------------------------------");
+                println!("{script_code}");
+                println!("------------------------------------------------------------");
+            } else {
+                let mut state = engine_core::TimeDilationState::new(multiplier);
+                let now_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                state.set_multiplier(multiplier, now_ns);
+                let virt_time = state.calculate_virtual_time(now_ns);
+                println!("Speed Hack Time Dilation State:");
+                println!("  Multiplier:   {:.2}x", state.multiplier);
+                println!("  Real Time:    {:.3} s", now_ns as f64 / 1_000_000_000.0);
+                println!("  Virtual Time: {:.3} s", virt_time as f64 / 1_000_000_000.0);
+            }
+        }
     }
 
     Ok(())
@@ -930,6 +1082,10 @@ mod tests {
         assert!(Cli::try_parse_from(["engine-plus", "resume", "-p", "1234"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "regs", "-p", "1234"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "bp", "-p", "1234", "-a", "0x7FFF1000"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "ptr-scan", "-p", "1234", "-t", "0x7FFF1000"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "ptr-resolve", "-p", "1234", "-m", "game.exe", "-b", "0x1000", "-o", "0x20", "0xF8"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "speedhack", "-m", "2.5"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "speedhack", "-m", "1.5", "-s"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "--mcp"]).is_ok());
     }
 

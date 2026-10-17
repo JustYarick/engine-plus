@@ -199,6 +199,10 @@ mod tests {
         assert!(tools.iter().any(|t| t["name"] == "debug_pause"));
         assert!(tools.iter().any(|t| t["name"] == "debug_resume"));
         assert!(tools.iter().any(|t| t["name"] == "debug_step"));
+        assert!(tools.iter().any(|t| t["name"] == "pointer_scan"));
+        assert!(tools.iter().any(|t| t["name"] == "pointer_resolve"));
+        assert!(tools.iter().any(|t| t["name"] == "speedhack_set"));
+        assert!(tools.iter().any(|t| t["name"] == "speedhack_generate_script"));
     }
 
     #[test]
@@ -384,5 +388,88 @@ mod tests {
         assert!(resp.result.is_none());
         let err = resp.error.expect("should return error");
         assert_eq!(err.code, -32601);
+    }
+
+    #[test]
+    fn test_mcp_tool_call_speedhack_and_script() {
+        let server = McpServer::new();
+
+        // 1. Set speedhack multiplier
+        let sh_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(20)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "speedhack_set",
+                "arguments": {
+                    "multiplier": 2.5
+                }
+            })),
+        };
+        let sh_resp = server.handle_request(sh_req).expect("should return response");
+        let sh_res = sh_resp.result.expect("result");
+        assert_eq!(sh_res["isError"], false);
+        let sh_text = sh_res["content"][0]["text"].as_str().unwrap();
+        assert!(sh_text.contains("2.50x"));
+
+        // 2. Generate speedhack AutoAssembler script for Linux
+        let gen_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(21)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "speedhack_generate_script",
+                "arguments": {
+                    "multiplier": 1.5,
+                    "target_platform": "linux"
+                }
+            })),
+        };
+        let gen_resp = server.handle_request(gen_req).expect("should return response");
+        let gen_res = gen_resp.result.expect("result");
+        assert_eq!(gen_res["isError"], false);
+        let gen_text = gen_res["content"][0]["text"].as_str().unwrap();
+        assert!(gen_text.contains("clock_gettime"));
+        assert!(gen_text.contains("[ENABLE]"));
+        assert!(gen_text.contains("[DISABLE]"));
+    }
+
+    #[test]
+    fn test_mcp_tool_call_pointer_tools_unattached() {
+        let server = McpServer::new();
+
+        // pointer_scan when unattached
+        let scan_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(22)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "pointer_scan",
+                "arguments": {
+                    "target_address": "0x123450"
+                }
+            })),
+        };
+        let scan_resp = server.handle_request(scan_req).expect("should return response");
+        let scan_res = scan_resp.result.expect("result");
+        assert_eq!(scan_res["isError"], true);
+
+        // pointer_resolve when unattached
+        let res_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(23)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "pointer_resolve",
+                "arguments": {
+                    "module": "game.exe",
+                    "base_offset": "0x1000",
+                    "offsets": ["0x20", "0xF8"]
+                }
+            })),
+        };
+        let res_resp = server.handle_request(res_req).expect("should return response");
+        let res_res = res_resp.result.expect("result");
+        assert_eq!(res_res["isError"], true);
     }
 }

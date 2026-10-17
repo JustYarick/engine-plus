@@ -3,11 +3,12 @@ use crate::protocol::{CallToolResult, Tool};
 use engine_core::{
     assemble_code, build_detour_hook, find_xrefs_in_code, generate_pattern_from_bytes,
     BreakpointManager, ClassStructure, FirstScanMode, HitTracer, MemoryScanner, NextScanMode,
-    ScanConfig, ScanValue, ScanValueType,
+    PointerMap, PointerPath, PointerScanner, PointerScannerConfig, ScanConfig, ScanValue,
+    ScanValueType, SpeedHackScriptGenerator, TimeDilationState,
 };
 use engine_pal::{
-    default_backend, default_enumerator, Address, BreakpointId, ProcessAccessLayer, ProcessId,
-    ProtectionFlags, WatchpointCondition, WatchpointSize,
+    default_backend, default_enumerator, Address, BreakpointId, MemoryReader, ProcessAccessLayer,
+    ProcessId, ProtectionFlags, WatchpointCondition, WatchpointSize,
 };
 use engine_script::{AutoAssembler, ScriptEngine};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
@@ -23,6 +24,7 @@ pub struct EngineSession {
     pub aa_allocations: Arc<Mutex<HashMap<String, Address>>>,
     pub debugger: Arc<Mutex<BreakpointManager>>,
     pub hit_tracers: Arc<Mutex<HashMap<Address, HitTracer>>>,
+    pub time_dilation: Arc<Mutex<TimeDilationState>>,
 }
 
 impl EngineSession {
@@ -40,6 +42,7 @@ impl EngineSession {
         ));
         let debugger = Arc::new(Mutex::new(BreakpointManager::new()));
         let hit_tracers = Arc::new(Mutex::new(HashMap::new()));
+        let time_dilation = Arc::new(Mutex::new(TimeDilationState::default()));
 
         EngineSession {
             pal,
@@ -48,6 +51,7 @@ impl EngineSession {
             aa_allocations,
             debugger,
             hit_tracers,
+            time_dilation,
         }
     }
 }
@@ -482,6 +486,67 @@ pub fn list_tools() -> Vec<Tool> {
                 }
             }),
         },
+        Tool {
+            name: "pointer_scan".to_string(),
+            description: "Multi-level Pointer Scanner: scans process memory to discover static pointer chains (e.g. 'module.exe+0x10F4F4 -> +0x20 -> +0xF8') that reliably resolve to target address across game restarts.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target_address": { "type": "string", "description": "Hex memory address to find pointer chains for (e.g. '0x7FFF123450')" },
+                    "max_depth": { "type": "integer", "default": 3, "description": "Maximum levels of pointer indirection (1..=5)" },
+                    "max_offset": { "type": "integer", "default": 4096, "description": "Maximum struct offset in bytes (e.g. 4096)" },
+                    "alignment": { "type": "integer", "default": 8, "description": "Memory alignment for pointer values (4 or 8)" },
+                    "max_results": { "type": "integer", "default": 50, "description": "Maximum number of pointer paths to return" },
+                    "module_filter": { "type": "string", "description": "Optional module name filter (e.g. 'ac_client')" }
+                },
+                "required": ["target_address"]
+            }),
+        },
+        Tool {
+            name: "pointer_resolve".to_string(),
+            description: "Resolve a multi-level pointer chain at runtime in the target process and return current resolved memory address and value.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "module_name": { "type": "string", "description": "Base module name (e.g. 'ac_client.exe')" },
+                    "base_offset": { "type": "string", "description": "Hex or decimal base offset (e.g. '0x10F4F4')" },
+                    "offsets": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Sequential struct offsets (e.g. ['0x20', '0xF8'] or ['32', '248'])"
+                    }
+                },
+                "required": ["module_name", "base_offset", "offsets"]
+            }),
+        },
+        Tool {
+            name: "speedhack_set".to_string(),
+            description: "Configure game execution speed via continuous time dilation state (e.g. 0.5 for half speed, 2.0 for 2x speed, 5.0 for 5x speed).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "multiplier": { "type": "number", "default": 1.0, "description": "Speed multiplier (e.g. 0.5, 1.0, 2.0, 5.0)" },
+                    "enabled": { "type": "boolean", "default": true, "description": "Enable or disable time dilation" }
+                },
+                "required": ["multiplier"]
+            }),
+        },
+        Tool {
+            name: "speedhack_generate_script".to_string(),
+            description: "Generate ready-to-run AutoAssembler script for intercepting system high-resolution timers (clock_gettime on Linux, QueryPerformanceCounter on Windows).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "multiplier": { "type": "number", "default": 2.0, "description": "Target speed multiplier" },
+                    "platform": {
+                        "type": "string",
+                        "enum": ["auto", "linux", "windows"],
+                        "default": "auto",
+                        "description": "Target OS timer API"
+                    }
+                }
+            }),
+        },
     ]
 }
 
@@ -492,7 +557,7 @@ pub fn dispatch_tool_call(
     args: Option<Value>,
 ) -> CallToolResult {
     let args = args.unwrap_or(json!({}));
-    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc, debugger_arc, hit_tracers_arc) = {
+    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc, debugger_arc, hit_tracers_arc, time_dilation_arc) = {
         let s = session_arc.lock().unwrap();
         (
             Arc::clone(&s.pal),
@@ -501,6 +566,7 @@ pub fn dispatch_tool_call(
             Arc::clone(&s.aa_allocations),
             Arc::clone(&s.debugger),
             Arc::clone(&s.hit_tracers),
+            Arc::clone(&s.time_dilation),
         )
     };
 
@@ -1593,6 +1659,186 @@ pub fn dispatch_tool_call(
                 })).unwrap_or_else(|e| CallToolResult::error(e.to_string())),
                 Err(e) => CallToolResult::error(format!("Single step failed: {e}")),
             }
+        }
+        "pointer_scan" => {
+            let addr_str = match args.get("target_address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing required parameter 'target_address'"),
+            };
+            let target_addr = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid target address '{addr_str}'")),
+            };
+
+            let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+            let max_offset = args.get("max_offset").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+            let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let module_filter = args.get("module_filter").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+
+            let regions = match pal.query_regions() {
+                Ok(r) => r,
+                Err(e) => return CallToolResult::error(format!("Failed to query regions: {e}")),
+            };
+
+            let mut modules = match pal.enumerate_modules() {
+                Ok(m) => m,
+                Err(e) => return CallToolResult::error(format!("Failed to enumerate modules: {e}")),
+            };
+
+            if let Some(ref filter) = module_filter {
+                modules.retain(|m| m.name.to_lowercase().contains(filter));
+            }
+
+            let ptr_size = pal.architecture().pointer_size();
+            let align = args.get("alignment").and_then(|v| v.as_u64()).map(|a| a as usize).unwrap_or(ptr_size);
+
+            let map = match PointerMap::build_from_memory(&**pal, &regions, ptr_size, align) {
+                Ok(m) => m,
+                Err(e) => return CallToolResult::error(format!("Failed to build pointer map: {e}")),
+            };
+
+            let config = PointerScannerConfig {
+                max_depth,
+                max_offset,
+                max_results,
+            };
+
+            let paths = PointerScanner::scan(&map, &modules, target_addr, &config);
+
+            let json_paths: Vec<Value> = paths
+                .iter()
+                .map(|p| {
+                    json!({
+                        "expression": format!("{p}"),
+                        "module": p.module_name,
+                        "base_offset": format!("0x{:X}", p.base_offset),
+                        "offsets": p.offsets.iter().map(|o| format!("0x{:X}", o)).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+
+            CallToolResult::json(&json!({
+                "target_address": format!("{target_addr}"),
+                "total_pointers_indexed": map.total_pointers(),
+                "paths_found": paths.len(),
+                "paths": json_paths
+            })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+        }
+        "pointer_resolve" => {
+            let module_name = match args.get("module_name").and_then(|v| v.as_str()) {
+                Some(m) => m,
+                None => return CallToolResult::error("Missing parameter 'module_name'"),
+            };
+            let base_offset_str = match args.get("base_offset").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return CallToolResult::error("Missing parameter 'base_offset'"),
+            };
+            let base_offset = match parse_hex_or_dec_address(base_offset_str) {
+                Some(a) => a.as_u64(),
+                None => return CallToolResult::error(format!("Invalid base_offset '{base_offset_str}'")),
+            };
+
+            let offsets_val = match args.get("offsets").and_then(|v| v.as_array()) {
+                Some(arr) => arr,
+                None => return CallToolResult::error("Missing parameter 'offsets' array"),
+            };
+
+            let mut parsed_offsets = Vec::new();
+            for o in offsets_val {
+                let off = if let Some(s) = o.as_str() {
+                    parse_hex_or_dec_address(s).map(|a| a.as_u64() as i64)
+                } else {
+                    o.as_i64()
+                };
+                match off {
+                    Some(val) => parsed_offsets.push(val),
+                    None => return CallToolResult::error(format!("Invalid offset: {o}")),
+                }
+            }
+
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+
+            let modules = match pal.enumerate_modules() {
+                Ok(m) => m,
+                Err(e) => return CallToolResult::error(format!("Failed to enumerate modules: {e}")),
+            };
+
+            let target_mod = modules.iter().find(|m| m.name.eq_ignore_ascii_case(module_name) || m.name.to_lowercase().contains(&module_name.to_lowercase()));
+            let module = match target_mod {
+                Some(m) => m,
+                None => return CallToolResult::error(format!("Module '{module_name}' not found in target process")),
+            };
+
+            let path = PointerPath {
+                module_name: module.name.clone(),
+                base_offset,
+                offsets: parsed_offsets,
+            };
+
+            match path.resolve(&**pal, module.base_address, pal.architecture()) {
+                Ok(resolved) => {
+                    let val_i32 = pal.read_i32(resolved).ok();
+                    let val_f32 = pal.read_f32(resolved).ok();
+                    let val_u64 = pal.read_u64(resolved).ok();
+                    CallToolResult::json(&json!({
+                        "expression": format!("{path}"),
+                        "module_base": format!("{}", module.base_address),
+                        "resolved_address": format!("{resolved}"),
+                        "value_i32": val_i32,
+                        "value_f32": val_f32,
+                        "value_u64": val_u64.map(|v| format!("0x{:X}", v)),
+                    })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+                Err(e) => CallToolResult::error(format!("Failed to resolve pointer path: {e}")),
+            }
+        }
+        "speedhack_set" => {
+            let mult = args.get("multiplier").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let enabled = args.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+
+            let mut td = time_dilation_arc.lock().unwrap();
+            td.enabled = enabled;
+            td.set_multiplier(mult, now_ns);
+
+            CallToolResult::json(&json!({
+                "status": "success",
+                "multiplier": td.multiplier,
+                "enabled": td.enabled,
+                "message": format!("SpeedHack configured to {:.2}x speed (enabled: {})", td.multiplier, td.enabled)
+            })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+        }
+        "speedhack_generate_script" => {
+            let mult = args.get("multiplier").and_then(|v| v.as_f64()).unwrap_or(2.0);
+            let platform = args.get("platform").and_then(|v| v.as_str()).unwrap_or("auto");
+
+            let script = match platform {
+                "windows" => SpeedHackScriptGenerator::generate_windows_aa_script(mult),
+                "linux" => SpeedHackScriptGenerator::generate_linux_aa_script(mult),
+                _ => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        SpeedHackScriptGenerator::generate_windows_aa_script(mult)
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        SpeedHackScriptGenerator::generate_linux_aa_script(mult)
+                    }
+                }
+            };
+
+            CallToolResult::text(script)
         }
         _ => CallToolResult::error(format!("Unknown tool: '{name}'")),
     }
