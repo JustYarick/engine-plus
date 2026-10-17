@@ -522,4 +522,28 @@ mod tests {
         let err_str = res.err().unwrap().to_string();
         assert!(err_str.contains("Watchdog triggered") || err_str.contains("timeout"));
     }
+
+    #[test]
+    fn test_script_engine_assembler_bindings() {
+        let pal: Arc<Mutex<Box<dyn ProcessAccessLayer>>> = Arc::new(Mutex::new(Box::new(DummyPal::new())));
+        let scanner = Arc::new(Mutex::new(MemoryScanner::new()));
+        let engine = ScriptEngine::new(pal, scanner).expect("Should create script engine");
+
+        let res = engine.execute("local bytes = assembler.assemble('nop\\nret', '0x1000', 64); return #bytes").expect("Should assemble");
+        assert_eq!(res, Value::Integer(2));
+    }
+
+    #[test]
+    fn test_script_engine_auto_assemble() {
+        let pal: Arc<Mutex<Box<dyn ProcessAccessLayer>>> = Arc::new(Mutex::new(Box::new(DummyPal::new())));
+        let scanner = Arc::new(Mutex::new(MemoryScanner::new()));
+        let engine = ScriptEngine::new(pal, scanner).expect("Should create script engine");
+
+        let script = r#"
+            local res = auto_assemble("[ENABLE]\n0x1000:\nnop\n")
+            return res.status
+        "#;
+        let res = engine.execute(script).expect("Should execute auto_assemble");
+        assert_eq!(res, Value::String(engine.lua.create_string("enabled").unwrap()));
+    }
 }

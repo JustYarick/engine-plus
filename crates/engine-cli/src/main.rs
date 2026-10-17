@@ -819,3 +819,33 @@ fn parse_hex_or_dec_val(s: &str) -> Option<u64> {
         s.parse::<u64>().ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parsing_subcommands() {
+        assert!(Cli::try_parse_from(["engine-plus", "console"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "ps", "--filter", "game"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "script", "-c", "return 1"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "aa", "-p", "1234", "-s", "[ENABLE]"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "assemble", "-c", "xor eax, eax"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "--mcp"]).is_ok());
+    }
+
+    #[test]
+    fn test_parse_cli_type() {
+        assert_eq!(parse_cli_type("i32").unwrap(), ScanValueType::I32);
+        assert_eq!(parse_cli_type("f32").unwrap(), ScanValueType::F32);
+        assert_eq!(parse_cli_type("aob").unwrap(), ScanValueType::Aob);
+        assert!(parse_cli_type("invalid").is_err());
+    }
+
+    #[test]
+    fn test_parse_hex_or_dec_val() {
+        assert_eq!(parse_hex_or_dec_val("0x1000"), Some(0x1000));
+        assert_eq!(parse_hex_or_dec_val("4096"), Some(4096));
+        assert_eq!(parse_hex_or_dec_val("bad"), None);
+    }
+}

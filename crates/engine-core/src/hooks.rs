@@ -169,4 +169,22 @@ mod tests {
         assert_eq!(hook.patch_bytes[14], 0x90); // 1 byte NOP padding
         assert_eq!(hook.return_address.as_u64(), target_ip + 15);
     }
+
+    #[test]
+    fn test_build_detour_hook_32bit() {
+        // 32-bit instructions:
+        // 55 (push ebp - 1 byte)
+        // 89 E5 (mov ebp, esp - 2 bytes)
+        // 83 EC 10 (sub esp, 16 - 3 bytes)
+        // Total = 6 bytes >= 5 bytes (rel32 jmp)
+        let original_code = [0x55, 0x89, 0xE5, 0x83, 0xEC, 0x10, 0x90];
+        let target_ip = 0x00401000;
+        let cave_ip = 0x00402000;
+        let hook = build_detour_hook(&original_code, target_ip, cave_ip, 32, &[]).expect("32-bit hook should succeed");
+        assert_eq!(hook.patch_bytes[0], 0xE9); // JMP rel32
+        assert_eq!(hook.original_bytes.len(), 6);
+        assert_eq!(hook.patch_bytes.len(), 6);
+        assert_eq!(hook.patch_bytes[5], 0x90); // 1 NOP
+        assert_eq!(hook.return_address.as_u64(), target_ip + 6);
+    }
 }

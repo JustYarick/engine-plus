@@ -566,4 +566,23 @@ mod tests {
         assert!(cs.contains("public struct EntityPlayer"));
         assert!(cs.contains("[FieldOffset("));
     }
+
+    #[test]
+    fn test_structure_rename_field() {
+        let mut buffer = vec![0u8; 16];
+        buffer[0..4].copy_from_slice(&100i32.to_le_bytes());
+        let mut structure = ClassStructure::reconstruct(Address::new(0x1000), &buffer, &[], None);
+        assert!(structure.rename_field(0, "m_iHealth").is_ok());
+        assert_eq!(structure.fields[0].name, "m_iHealth");
+        assert!(structure.rename_field(999, "invalid").is_err());
+    }
+
+    #[test]
+    fn test_structure_inline_string_detection() {
+        let mut buffer = vec![0u8; 32];
+        let name = b"JohnDoe\0";
+        buffer[4..4 + name.len()].copy_from_slice(name);
+        let structure = ClassStructure::reconstruct(Address::new(0x1000), &buffer, &[], None);
+        assert!(structure.fields.iter().any(|f| matches!(&f.field_type, FieldType::InlineString { text, .. } if text == "JohnDoe")));
+    }
 }
