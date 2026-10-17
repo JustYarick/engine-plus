@@ -21,3 +21,5 @@ tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 iced-x86.workspace = true
+object.workspace = true
+gimli.workspace = true

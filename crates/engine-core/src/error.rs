@@ -18,6 +18,12 @@ pub enum CoreError {
     #[error("Debugger error: {0}")]
     Debugger(String),
 
+    #[error("Analysis error: {0}")]
+    Analysis(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

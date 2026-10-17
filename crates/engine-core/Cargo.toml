@@ -17,6 +17,8 @@ bitflags.workspace = true
 crossbeam-channel.workspace = true
 tokio.workspace = true
 iced-x86.workspace = true
+object.workspace = true
+gimli.workspace = true
 
 [dev-dependencies]
 libc.workspace = true

@@ -198,7 +198,8 @@ impl Default for PointerScannerConfig {
 pub struct PointerScanner;
 
 impl PointerScanner {
-    /// Perform backward graph search from `target_address` to find static module-relative paths
+    /// Perform backward graph search from `target_address` to find static module-relative paths.
+    /// Uses iterative deepening to guarantee shortest, direct static chains appear first.
     pub fn scan(
         map: &PointerMap,
         modules: &[ModuleInfo],
@@ -206,26 +207,44 @@ impl PointerScanner {
         config: &PointerScannerConfig,
     ) -> Vec<PointerPath> {
         let mut results = Vec::new();
-        let mut visited = HashSet::new();
+        let mut seen_paths = HashSet::new();
 
         let module_ranges: Vec<(&ModuleInfo, u64, u64)> = modules
             .iter()
             .map(|m| (m, m.base_address.as_u64(), m.base_address.as_u64() + m.size as u64))
             .collect();
 
-        let mut current_offsets = Vec::new();
-        Self::search_backward(
-            map,
-            &module_ranges,
-            target_address,
-            0,
-            config.max_depth,
-            config.max_offset,
-            config.max_results,
-            &mut current_offsets,
-            &mut visited,
-            &mut results,
-        );
+        // Iterative deepening: search depth 1 first, then 2, ..., up to max_depth
+        for depth_limit in 1..=config.max_depth {
+            if results.len() >= config.max_results {
+                break;
+            }
+
+            let mut current_offsets = Vec::new();
+            let mut visited = HashSet::new();
+            Self::search_backward(
+                map,
+                &module_ranges,
+                target_address,
+                0,
+                depth_limit,
+                config.max_offset,
+                config.max_results,
+                &mut current_offsets,
+                &mut visited,
+                &mut seen_paths,
+                &mut results,
+            );
+        }
+
+        // Sort results: shortest chains first, then lowest base offset
+        results.sort_by(|a, b| {
+            a.offsets
+                .len()
+                .cmp(&b.offsets.len())
+                .then_with(|| a.base_offset.cmp(&b.base_offset))
+                .then_with(|| a.module_name.cmp(&b.module_name))
+        });
 
         results
     }
@@ -236,21 +255,32 @@ impl PointerScanner {
         modules: &[(&ModuleInfo, u64, u64)],
         current_target: Address,
         current_depth: usize,
-        max_depth: usize,
+        depth_limit: usize,
         max_offset: usize,
         max_results: usize,
         current_offsets: &mut Vec<i64>,
         visited: &mut HashSet<Address>,
+        seen_paths: &mut HashSet<String>,
         results: &mut Vec<PointerPath>,
     ) {
-        if results.len() >= max_results || current_depth >= max_depth {
+        if results.len() >= max_results || current_depth >= depth_limit {
             return;
         }
 
         let min_target = current_target.sub(max_offset);
         let max_target = current_target;
 
-        let candidates = map.find_pointers_in_range(min_target, max_target);
+        let mut candidates: Vec<&PointerEntry> = map
+            .find_pointers_in_range(min_target, max_target)
+            .iter()
+            .collect();
+
+        // Partition candidates so static module pointers are checked FIRST
+        candidates.sort_by_key(|entry| {
+            let src = entry.source.as_u64();
+            let is_static = modules.iter().any(|(_, start, end)| src >= *start && src < *end);
+            !is_static // static modules first (false < true)
+        });
 
         for entry in candidates {
             if results.len() >= max_results {
@@ -270,30 +300,34 @@ impl PointerScanner {
                 path_offsets.push(delta);
                 path_offsets.reverse();
 
-                results.push(PointerPath {
-                    module_name: module.name.clone(),
-                    base_offset: source_u64 - start,
-                    offsets: path_offsets,
-                });
+                let path_key = format!("{}+{:#x}:{:?}", module.name, source_u64 - start, path_offsets);
+                if seen_paths.insert(path_key) {
+                    results.push(PointerPath {
+                        module_name: module.name.clone(),
+                        base_offset: source_u64 - start,
+                        offsets: path_offsets,
+                    });
 
-                if results.len() >= max_results {
-                    return;
+                    if results.len() >= max_results {
+                        return;
+                    }
                 }
             }
 
             // Continue searching one level deeper if not visited on this branch
-            if current_depth + 1 < max_depth && visited.insert(entry.source) {
+            if current_depth + 1 < depth_limit && visited.insert(entry.source) {
                 current_offsets.push(delta);
                 Self::search_backward(
                     map,
                     modules,
                     entry.source,
                     current_depth + 1,
-                    max_depth,
+                    depth_limit,
                     max_offset,
                     max_results,
                     current_offsets,
                     visited,
+                    seen_paths,
                     results,
                 );
                 current_offsets.pop();
@@ -441,4 +475,44 @@ mod tests {
         let resolved = path.resolve(&pal, Address::new(0x400000), CpuArchitecture::X86_64).unwrap();
         assert_eq!(resolved.as_u64(), 0x200F8);
     }
+
+    #[test]
+    fn test_shortest_static_chain_priority() {
+        // Test that a direct 1-level static chain is prioritized over a deep multi-level chain
+        // Static module: 0x400000..0x500000
+        // Target: 0x286A780
+        // Chain A (Direct 1-level): [ac_client + 0x1A3518] points to 0x286A680 (+ 0x100 -> 0x286A780)
+        // Chain B (Deep 3-level): [ac_client + 0x500] -> [0x7FFF00] -> [0x7FFF50] -> 0x286A780
+        let entries = vec![
+            // Chain B entries
+            PointerEntry { source: Address::new(0x400500), target: Address::new(0x7FFF00) },
+            PointerEntry { source: Address::new(0x7FFF00), target: Address::new(0x7FFF50) },
+            PointerEntry { source: Address::new(0x7FFF50), target: Address::new(0x286A780) },
+            // Chain A entry (Direct static)
+            PointerEntry { source: Address::new(0x400000 + 0x1A3518), target: Address::new(0x286A680) },
+        ];
+
+        let map = PointerMap::new(entries, 8);
+        let modules = vec![ModuleInfo {
+            name: "linux_64_client".to_string(),
+            path: "/path/to/linux_64_client".to_string(),
+            base_address: Address::new(0x400000),
+            size: 0x200000,
+        }];
+
+        let target = Address::new(0x286A780);
+        let config = PointerScannerConfig {
+            max_depth: 3,
+            max_offset: 1024,
+            max_results: 10,
+        };
+
+        let paths = PointerScanner::scan(&map, &modules, target, &config);
+        assert!(!paths.is_empty(), "Should find at least 1 path");
+        // Result #0 MUST be the direct 1-level static chain!
+        assert_eq!(paths[0].offsets.len(), 1, "Shortest chain must come first");
+        assert_eq!(paths[0].base_offset, 0x1A3518);
+        assert_eq!(paths[0].offsets, vec![0x100]);
+    }
 }
+

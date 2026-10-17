@@ -472,4 +472,130 @@ mod tests {
         let res_res = res_resp.result.expect("result");
         assert_eq!(res_res["isError"], true);
     }
+
+    #[test]
+    fn test_mcp_new_tools_registration_and_execution() {
+        let server = McpServer::new();
+
+        // 1. Check tools/list contains all 5 new tools
+        let list_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(30)),
+            method: "tools/list".to_string(),
+            params: None,
+        };
+        let list_resp = server.handle_request(list_req).expect("should return response");
+        let list_res = list_resp.result.expect("result");
+        let tools = list_res["tools"].as_array().expect("tools array");
+        let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+        assert!(tool_names.contains(&"memory_read_batch"));
+        assert!(tool_names.contains(&"module_list"));
+        assert!(tool_names.contains(&"symbol_lookup"));
+        assert!(tool_names.contains(&"struct_layout"));
+        assert!(tool_names.contains(&"struct_diff"));
+
+        // 2. Attach to self
+        let my_pid = std::process::id();
+        let attach_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(31)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "process_attach",
+                "arguments": { "pid": my_pid }
+            })),
+        };
+        let attach_resp = server.handle_request(attach_req).expect("attach response");
+        assert_eq!(attach_resp.result.unwrap()["isError"], false);
+
+        // 3. Test memory_read_batch on self
+        let var1: i32 = 0x12345678;
+        let var2: f32 = 13.37;
+        let addr1 = format!("0x{:X}", &var1 as *const i32 as u64);
+        let addr2 = format!("0x{:X}", &var2 as *const f32 as u64);
+
+        let batch_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(32)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "memory_read_batch",
+                "arguments": {
+                    "reads": [
+                        { "address": addr1, "val_type": "i32", "tag": "test_int" },
+                        { "address": addr2, "val_type": "f32", "tag": "test_float" }
+                    ]
+                }
+            })),
+        };
+        let batch_resp = server.handle_request(batch_req).expect("batch response");
+        let batch_res = batch_resp.result.unwrap();
+        assert_eq!(batch_res["isError"], false);
+        let batch_text = batch_res["content"][0]["text"].as_str().unwrap();
+        let batch_json: serde_json::Value = serde_json::from_str(batch_text).expect("valid json");
+        assert_eq!(batch_json["count"], 2);
+        assert_eq!(batch_json["results"][0]["value"], 0x12345678);
+        assert_eq!(batch_json["results"][0]["tag"], "test_int");
+
+        // 4. Test struct_diff with snapshot_id on self
+        let mut buffer = vec![0x10u8, 0x20, 0x30, 0x40, 0x00, 0x00, 0x00, 0x00];
+        let buf_addr = format!("0x{:X}", buffer.as_ptr() as u64);
+
+        let diff_req1 = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(33)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "struct_diff",
+                "arguments": {
+                    "address": buf_addr,
+                    "size": 8,
+                    "snapshot_id": "test_snap"
+                }
+            })),
+        };
+        let diff_resp1 = server.handle_request(diff_req1).expect("diff response 1");
+        let diff_res1 = diff_resp1.result.unwrap();
+        assert_eq!(diff_res1["isError"], false);
+        let diff_text1 = diff_res1["content"][0]["text"].as_str().unwrap();
+        assert!(diff_text1.contains("baseline_saved"));
+
+        // Modify buffer
+        buffer[0] = 0x99;
+
+        let diff_req2 = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(34)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "struct_diff",
+                "arguments": {
+                    "address": buf_addr,
+                    "size": 8,
+                    "snapshot_id": "test_snap"
+                }
+            })),
+        };
+        let diff_resp2 = server.handle_request(diff_req2).expect("diff response 2");
+        let diff_res2 = diff_resp2.result.unwrap();
+        assert_eq!(diff_res2["isError"], false);
+        let diff_text2 = diff_res2["content"][0]["text"].as_str().unwrap();
+        assert!(diff_text2.contains("compared_with_previous"));
+        assert!(diff_text2.contains("99") || diff_text2.contains("changed_fields"));
+
+        // 5. Test module_list
+        let mod_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(35)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "module_list",
+                "arguments": {}
+            })),
+        };
+        let mod_resp = server.handle_request(mod_req).expect("module list response");
+        let mod_res = mod_resp.result.unwrap();
+        assert_eq!(mod_res["isError"], false);
+    }
 }

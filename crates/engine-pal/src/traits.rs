@@ -1,7 +1,7 @@
 use crate::error::PalResult;
 use crate::types::{
-    Address, BreakpointId, BreakpointType, CpuArchitecture, CpuRegisters, MemoryRegion, ModuleInfo,
-    ProcessEntry, ProcessId, ProtectionFlags, StealthLevel, ThreadInfo,
+    Address, BreakpointId, BreakpointType, CpuArchitecture, CpuRegisters, DebugHit, MemoryRegion,
+    ModuleInfo, ProcessEntry, ProcessId, ProtectionFlags, StealthLevel, ThreadInfo,
 };
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -84,6 +84,19 @@ pub trait ProcessAccessLayer: Send + Sync {
         Err(crate::error::PalError::NotSupported {
             backend: self.backend_name(),
             feature: "single_step not implemented".to_string(),
+        })
+    }
+
+    /// Trace hardware watchpoint hits on memory address (writes or accesses)
+    fn trace_watchpoint(
+        &mut self,
+        _address: Address,
+        _size: usize,
+        _duration_ms: u64,
+    ) -> PalResult<Vec<DebugHit>> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "Hardware watchpoint tracing not supported by this backend".to_string(),
         })
     }
 

@@ -3,7 +3,7 @@ use crate::os::linux::proc_maps::{parse_process_maps, parse_process_modules};
 use crate::os::linux::process_list::detect_process_arch;
 use crate::traits::ProcessAccessLayer;
 use crate::types::{
-    Address, BreakpointId, BreakpointType, CpuArchitecture, MemoryRegion, ModuleInfo,
+    Address, BreakpointId, BreakpointType, CpuArchitecture, CpuRegisters, MemoryRegion, ModuleInfo,
     ProcessId, ProtectionFlags, StealthLevel, ThreadInfo,
 };
 use nix::sys::uio::{process_vm_readv, process_vm_writev, RemoteIoVec};
@@ -175,18 +175,34 @@ impl ProcessAccessLayer for ProcessVmBackend {
             .map_err(|e| PalError::Io(std::io::Error::from_raw_os_error(e as i32)))
     }
 
-    fn allocate_memory(&self, _size: usize, _protection: ProtectionFlags) -> PalResult<Address> {
-        Err(PalError::NotSupported {
-            backend: self.backend_name(),
-            feature: "Remote allocation requires ptrace injection or kernel driver".to_string(),
-        })
+    fn get_registers(&self, thread_id: Option<ProcessId>) -> PalResult<CpuRegisters> {
+        let pid = thread_id.or(self.attached_pid).ok_or(PalError::NotAttached)?;
+        super::ptrace_ops::read_cpu_registers(pid)
     }
 
-    fn free_memory(&self, _address: Address) -> PalResult<()> {
-        Err(PalError::NotSupported {
-            backend: self.backend_name(),
-            feature: "Remote free requires ptrace injection or kernel driver".to_string(),
-        })
+    fn single_step(&mut self, thread_id: Option<ProcessId>) -> PalResult<CpuRegisters> {
+        let pid = thread_id.or(self.attached_pid).ok_or(PalError::NotAttached)?;
+        super::ptrace_ops::step_instruction(pid)
+    }
+
+    fn trace_watchpoint(
+        &mut self,
+        address: Address,
+        size: usize,
+        duration_ms: u64,
+    ) -> PalResult<Vec<crate::types::DebugHit>> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        super::ptrace_ops::trace_hardware_watchpoint(pid, address, size, duration_ms)
+    }
+
+    fn allocate_memory(&self, size: usize, protection: ProtectionFlags) -> PalResult<Address> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        super::ptrace_ops::remote_allocate(pid, size, protection)
+    }
+
+    fn free_memory(&self, address: Address) -> PalResult<()> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        super::ptrace_ops::remote_free(pid, address, 4096)
     }
 
     fn stealth_level(&self) -> StealthLevel {

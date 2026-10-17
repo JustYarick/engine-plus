@@ -68,6 +68,41 @@ pub fn find_xrefs_in_code(
                         });
                     }
                 }
+                OpKind::Memory => {
+                    let disp = instruction.memory_displacement64();
+                    if disp == target_address {
+                        let mut instr_text = String::new();
+                        formatter.format(&instruction, &mut instr_text);
+                        results.push(XRefEntry {
+                            instruction_address: Address::new(ip),
+                            target_address: Address::new(target_address),
+                            xref_type: XRefType::AbsolutePointer,
+                            instruction_text: instr_text,
+                        });
+                    }
+                }
+                OpKind::Immediate32 | OpKind::Immediate32to64 => {
+                    if (instruction.immediate32() as u64) == target_address {
+                        let mut instr_text = String::new();
+                        formatter.format(&instruction, &mut instr_text);
+                        results.push(XRefEntry {
+                            instruction_address: Address::new(ip),
+                            target_address: Address::new(target_address),
+                            xref_type: XRefType::AbsolutePointer,
+                            instruction_text: instr_text,
+                        });
+                    }
+                }
+                OpKind::Immediate64 if instruction.immediate64() == target_address => {
+                    let mut instr_text = String::new();
+                    formatter.format(&instruction, &mut instr_text);
+                    results.push(XRefEntry {
+                        instruction_address: Address::new(ip),
+                        target_address: Address::new(target_address),
+                        xref_type: XRefType::AbsolutePointer,
+                        instruction_text: instr_text,
+                    });
+                }
                 _ => {}
             }
         }

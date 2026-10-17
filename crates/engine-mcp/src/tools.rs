@@ -1,10 +1,11 @@
 use crate::optimizer::analyze_memory_block;
 use crate::protocol::{CallToolResult, Tool};
 use engine_core::{
-    assemble_code, build_detour_hook, find_xrefs_in_code, generate_pattern_from_bytes,
-    BreakpointManager, ClassStructure, FirstScanMode, HitTracer, MemoryScanner, NextScanMode,
-    PointerMap, PointerPath, PointerScanner, PointerScannerConfig, ScanConfig, ScanValue,
-    ScanValueType, SpeedHackScriptGenerator, TimeDilationState,
+    assemble_code, build_detour_hook, compute_struct_diff, find_xrefs_in_code,
+    generate_pattern_from_bytes, inspect_dwarf_struct, inspect_module, list_dwarf_structs,
+    lookup_symbols, BreakpointManager, ClassStructure, FirstScanMode, HitTracer, MemoryScanner,
+    NextScanMode, PointerMap, PointerPath, PointerScanner, PointerScannerConfig, ScanConfig,
+    ScanValue, ScanValueType, SpeedHackScriptGenerator, TimeDilationState,
 };
 use engine_pal::{
     default_backend, default_enumerator, Address, BreakpointId, MemoryReader, ProcessAccessLayer,
@@ -16,6 +17,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+pub type SnapshotMap = HashMap<String, (Address, Vec<u8>)>;
+
 /// Global state session for active process and scanning operations in MCP
 pub struct EngineSession {
     pub pal: Arc<Mutex<Box<dyn ProcessAccessLayer>>>,
@@ -25,6 +28,7 @@ pub struct EngineSession {
     pub debugger: Arc<Mutex<BreakpointManager>>,
     pub hit_tracers: Arc<Mutex<HashMap<Address, HitTracer>>>,
     pub time_dilation: Arc<Mutex<TimeDilationState>>,
+    pub snapshots: Arc<Mutex<SnapshotMap>>,
 }
 
 impl EngineSession {
@@ -43,6 +47,7 @@ impl EngineSession {
         let debugger = Arc::new(Mutex::new(BreakpointManager::new()));
         let hit_tracers = Arc::new(Mutex::new(HashMap::new()));
         let time_dilation = Arc::new(Mutex::new(TimeDilationState::default()));
+        let snapshots = Arc::new(Mutex::new(HashMap::new()));
 
         EngineSession {
             pal,
@@ -52,9 +57,11 @@ impl EngineSession {
             debugger,
             hit_tracers,
             time_dilation,
+            snapshots,
         }
     }
 }
+
 
 impl Default for EngineSession {
     fn default() -> Self {
@@ -309,16 +316,17 @@ pub fn list_tools() -> Vec<Tool> {
         },
         Tool {
             name: "find_xrefs".to_string(),
-            description: "Scan code memory for cross-references (calls, jumps, and RIP-relative data loads) pointing to a target address.".to_string(),
+            description: "Scan code memory for cross-references (calls, jumps, RIP-relative data loads, and absolute pointers) pointing to a target address. If search_start/search_size are omitted, scans all executable regions of the process automatically.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "target_address": { "type": "string", "description": "Address of target function or data to find references to" },
-                    "search_start": { "type": "string", "description": "Starting address of memory region/module to scan" },
-                    "search_size": { "type": "integer", "description": "Number of bytes to scan (e.g. 65536 or module size)" },
+                    "search_start": { "type": "string", "description": "Optional starting address of memory region/module to scan" },
+                    "search_size": { "type": "integer", "description": "Optional number of bytes to scan (e.g. 65536 or module size)" },
+                    "module": { "type": "string", "description": "Optional module name filter (e.g. 'linux_64_client')" },
                     "bitness": { "type": "integer", "enum": [32, 64], "description": "Optional bitness override" }
                 },
-                "required": ["target_address", "search_start", "search_size"]
+                "required": ["target_address"]
             }),
         },
         Tool {
@@ -547,6 +555,91 @@ pub fn list_tools() -> Vec<Tool> {
                 }
             }),
         },
+        Tool {
+            name: "memory_read_batch".to_string(),
+            description: "Read multiple memory addresses or pointer chains in a single round-trip with typed parsing (i32, f32, u64, pointer, string, hex) to eliminate latency and round-trip overhead.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reads": {
+                        "type": "array",
+                        "description": "Array of read operations",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "address": { "type": "string", "description": "Direct hex address (e.g. '0x286A780')" },
+                                "chain": {
+                                    "type": "object",
+                                    "description": "Optional multi-level pointer chain to resolve",
+                                    "properties": {
+                                        "module": { "type": "string", "description": "Module name (e.g. 'linux_64_client')" },
+                                        "base_offset": { "type": "string", "description": "Base offset (e.g. '0x1A3518')" },
+                                        "offsets": { "type": "array", "items": { "type": "string" }, "description": "Chain offsets (e.g. ['0x100'])" }
+                                    }
+                                },
+                                "val_type": {
+                                    "type": "string",
+                                    "enum": ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "pointer", "hex", "string"],
+                                    "default": "i32"
+                                },
+                                "size": { "type": "integer", "description": "Number of bytes to read (for hex/string)" },
+                                "tag": { "type": "string", "description": "Label identifier for response (e.g. 'health', 'position_x')" }
+                            }
+                        }
+                    }
+                },
+                "required": ["reads"]
+            }),
+        },
+        Tool {
+            name: "module_list".to_string(),
+            description: "List all loaded modules/binaries with runtime base address, size, file path, PIE (Position Independent Executable) flag, and section boundaries.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filter": { "type": "string", "description": "Optional substring filter for module name" }
+                }
+            }),
+        },
+        Tool {
+            name: "symbol_lookup".to_string(),
+            description: "Search symbols (functions, global variables, static entity pointers) from ELF/PE symbol tables (.symtab and .dynsym) matching a pattern.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Symbol name or substring to search for (e.g. 'player', 'updateworld', 'health')" },
+                    "module": { "type": "string", "description": "Optional module name or file path (if omitted, uses main executable)" },
+                    "limit": { "type": "integer", "default": 50, "description": "Max symbols to return" }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        Tool {
+            name: "struct_layout".to_string(),
+            description: "Extract structure or class type layout directly from binary DWARF debug symbols (.debug_info). Yields exact member variable names, byte offsets, and types without guesswork.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Struct or class name (e.g. 'playerent', 'fpsent', 'vec', 'weapon')" },
+                    "module": { "type": "string", "description": "Optional module name or file path (if omitted, uses main executable)" },
+                    "list_all": { "type": "boolean", "default": false, "description": "If true, list available struct/class names instead" }
+                }
+            }),
+        },
+        Tool {
+            name: "struct_diff".to_string(),
+            description: "Diff an object memory block over time or between snapshots to see which bytes/variables changed during an in-game action (e.g. firing, taking damage, changing team).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Starting hex address of object (e.g. '0x286A780')" },
+                    "size": { "type": "integer", "default": 256, "description": "Object size in bytes (default: 256)" },
+                    "duration_ms": { "type": "integer", "description": "Wait duration in ms between two automatic snapshots (e.g. 500 or 1000)" },
+                    "snapshot_id": { "type": "string", "description": "Optional named snapshot key for manual before/after comparisons across calls" }
+                },
+                "required": ["address"]
+            }),
+        },
     ]
 }
 
@@ -557,7 +650,7 @@ pub fn dispatch_tool_call(
     args: Option<Value>,
 ) -> CallToolResult {
     let args = args.unwrap_or(json!({}));
-    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc, debugger_arc, hit_tracers_arc, time_dilation_arc) = {
+    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc, debugger_arc, hit_tracers_arc, time_dilation_arc, snapshots_arc) = {
         let s = session_arc.lock().unwrap();
         (
             Arc::clone(&s.pal),
@@ -567,6 +660,7 @@ pub fn dispatch_tool_call(
             Arc::clone(&s.debugger),
             Arc::clone(&s.hit_tracers),
             Arc::clone(&s.time_dilation),
+            Arc::clone(&s.snapshots),
         )
     };
 
@@ -723,7 +817,15 @@ pub fn dispatch_tool_call(
             };
 
             let type_str = args.get("val_type").and_then(|v| v.as_str()).unwrap_or("i32");
-            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+            let default_size = match type_str {
+                "i8" | "u8" | "byte" => 1,
+                "i16" | "u16" | "short" => 2,
+                "i32" | "u32" | "f32" | "int" | "float" => 4,
+                "i64" | "u64" | "f64" | "long" | "double" | "pointer" | "ptr" => 8,
+                "string" => 64,
+                _ => 4,
+            };
+            let size = args.get("size").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(default_size);
 
             let pal = pal_arc.lock().unwrap();
             if !pal.is_attached() {
@@ -733,13 +835,19 @@ pub fn dispatch_tool_call(
             match pal.read_raw(addr, size) {
                 Ok(bytes) => {
                     let val = match type_str {
-                        "i32" if bytes.len() >= 4 => json!(i32::from_le_bytes(bytes[..4].try_into().unwrap())),
-                        "u32" if bytes.len() >= 4 => json!(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
-                        "f32" if bytes.len() >= 4 => json!(f32::from_le_bytes(bytes[..4].try_into().unwrap())),
-                        "i64" if bytes.len() >= 8 => json!(i64::from_le_bytes(bytes[..8].try_into().unwrap())),
-                        "u64" if bytes.len() >= 8 => json!(u64::from_le_bytes(bytes[..8].try_into().unwrap())),
-                        "f64" if bytes.len() >= 8 => json!(f64::from_le_bytes(bytes[..8].try_into().unwrap())),
-                        "string" => json!(String::from_utf8_lossy(&bytes)),
+                        "i8" if !bytes.is_empty() => json!(bytes[0] as i8),
+                        "u8" | "byte" if !bytes.is_empty() => json!(bytes[0]),
+                        "i16" | "short" if bytes.len() >= 2 => json!(i16::from_le_bytes(bytes[..2].try_into().unwrap_or([0; 2]))),
+                        "u16" if bytes.len() >= 2 => json!(u16::from_le_bytes(bytes[..2].try_into().unwrap_or([0; 2]))),
+                        "i32" | "int" if bytes.len() >= 4 => json!(i32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                        "u32" if bytes.len() >= 4 => json!(u32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                        "f32" | "float" if bytes.len() >= 4 => json!(f32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                        "i64" | "long" if bytes.len() >= 8 => json!(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                        "u64" if bytes.len() >= 8 => json!(u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                        "f64" | "double" if bytes.len() >= 8 => json!(f64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                        "pointer" | "ptr" if bytes.len() >= 8 => json!(format!("0x{:X}", u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8])))),
+                        "pointer" | "ptr" if bytes.len() >= 4 => json!(format!("0x{:X}", u32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4])))),
+                        "string" => json!(String::from_utf8_lossy(&bytes).trim_matches('\0')),
                         _ => {
                             let hex_str = bytes
                                 .iter()
@@ -1245,20 +1353,6 @@ pub fn dispatch_tool_call(
                 None => return CallToolResult::error(format!("Invalid target_address: '{target_str}'")),
             };
 
-            let start_str = match args.get("search_start").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => return CallToolResult::error("Missing parameter 'search_start'"),
-            };
-            let start_addr = match parse_hex_or_dec_address(start_str) {
-                Some(a) => a,
-                None => return CallToolResult::error(format!("Invalid search_start: '{start_str}'")),
-            };
-
-            let search_size = match args.get("search_size").and_then(|v| v.as_u64()) {
-                Some(s) => (s as usize).min(10 * 1024 * 1024),
-                None => return CallToolResult::error("Missing parameter 'search_size'"),
-            };
-
             let pal = pal_arc.lock().unwrap();
             if !pal.is_attached() {
                 return CallToolResult::error("No process attached. Use 'process_attach' first.");
@@ -1270,20 +1364,73 @@ pub fn dispatch_tool_call(
                 }
             });
 
-            let code_bytes = match pal.read_raw(start_addr, search_size) {
-                Ok(b) => b,
-                Err(e) => return CallToolResult::error(format!("Failed to read memory at search_start: {e}")),
-            };
+            let mut all_xrefs = Vec::new();
 
-            let xrefs = find_xrefs_in_code(&code_bytes, start_addr.as_u64(), bitness, target_addr.as_u64());
+            if let (Some(start_str), Some(search_size)) = (
+                args.get("search_start").and_then(|v| v.as_str()),
+                args.get("search_size").and_then(|v| v.as_u64()),
+            ) {
+                let start_addr = match parse_hex_or_dec_address(start_str) {
+                    Some(a) => a,
+                    None => return CallToolResult::error(format!("Invalid search_start: '{start_str}'")),
+                };
+                let search_size = (search_size as usize).min(10 * 1024 * 1024);
+                if let Ok(bytes) = pal.read_raw(start_addr, search_size) {
+                    all_xrefs = find_xrefs_in_code(&bytes, start_addr.as_u64(), bitness, target_addr.as_u64());
+                }
+            } else {
+                // Auto-scan all executable regions of attached process or specified module
+                let module_filter = args.get("module").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+                let filter_modules = if let Some(ref filter) = module_filter {
+                    pal.enumerate_modules()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|m| m.name.to_lowercase().contains(filter) || m.path.to_lowercase().contains(filter))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+
+                if let Ok(regions) = pal.query_regions() {
+                    let rx_regions: Vec<_> = regions
+                        .into_iter()
+                        .filter(|r| {
+                            if !r.is_executable() || !r.is_readable() {
+                                return false;
+                            }
+                            if module_filter.is_some() {
+                                filter_modules.iter().any(|m| r.start >= m.base_address && r.start < m.base_address.add(m.size))
+                            } else {
+                                true
+                            }
+                        })
+                        .collect();
+
+                    for r in rx_regions {
+                        // If module filter is provided, check if region name or path matches
+                        let scan_size = r.size.min(1024 * 1024); // up to 1MB per chunk
+                        let mut offset = 0;
+                        while offset < scan_size {
+                            let chunk_size = (scan_size - offset).min(128 * 1024);
+                            let chunk_addr = r.start.add(offset);
+                            if let Ok(bytes) = pal.read_raw(chunk_addr, chunk_size) {
+                                let mut hits = find_xrefs_in_code(&bytes, chunk_addr.as_u64(), bitness, target_addr.as_u64());
+                                all_xrefs.append(&mut hits);
+                            }
+                            offset += chunk_size;
+                        }
+                    }
+                }
+            }
+
             CallToolResult::json(&json!({
                 "target_address": format!("0x{:X}", target_addr.as_u64()),
-                "search_range": format!("0x{:X} - 0x{:X}", start_addr.as_u64(), start_addr.as_u64() + search_size as u64),
-                "count": xrefs.len(),
-                "xrefs": xrefs
+                "count": all_xrefs.len(),
+                "xrefs": all_xrefs
             }))
             .unwrap_or_else(|e| CallToolResult::error(e.to_string()))
         }
+
         "memory_allocate" => {
             let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
             let prot_str = args.get("protection").and_then(|v| v.as_str()).unwrap_or("rwx");
@@ -1541,8 +1688,43 @@ pub fn dispatch_tool_call(
                 HitTracer::new(target_addr, size, WatchpointCondition::Write)
             });
 
-            // Inspect executable memory for code referencing or modifying this address
+            // 1. Try real hardware watchpoint via PAL
+            let mut hw_success = false;
             {
+                let mut pal = pal_arc.lock().unwrap();
+                if pal.is_attached() {
+                    if let Ok(hits) = pal.trace_watchpoint(target_addr, size, duration_ms) {
+                        if !hits.is_empty() {
+                            hw_success = true;
+                            for hit in hits {
+                                let bitness = match pal.architecture() {
+                                    engine_pal::CpuArchitecture::X86_32 => 32,
+                                    engine_pal::CpuArchitecture::X86_64 => 64,
+                                };
+                                let disasm = if let Ok(code) = pal.read_raw(hit.instruction_pointer, 15) {
+                                    let mut decoder = Decoder::with_ip(bitness, &code, hit.instruction_pointer.as_u64(), DecoderOptions::NONE);
+                                    let mut formatter = IntelFormatter::new();
+                                    let mut instr = Instruction::default();
+                                    if decoder.can_decode() {
+                                        decoder.decode_out(&mut instr);
+                                        let mut s = String::new();
+                                        formatter.format(&instr, &mut s);
+                                        Some(s)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                tracer.record_hit(hit.instruction_pointer, hit.registers, disasm, hit.thread_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. If no hardware hits recorded, fallback to executable memory xrefs scan
+            if !hw_success {
                 let pal = pal_arc.lock().unwrap();
                 if let Ok(regions) = pal.query_regions() {
                     let rx_regions: Vec<_> = regions.into_iter().filter(|r| r.is_executable() && r.is_readable()).collect();
@@ -1572,6 +1754,7 @@ pub fn dispatch_tool_call(
             CallToolResult::json(&json!({
                 "target_address": format!("{target_addr}"),
                 "duration_ms": duration_ms,
+                "hardware_tracing_active": hw_success,
                 "total_hits": tracer.total_hits(),
                 "unique_instructions": tracer.unique_instructions_count(),
                 "table_view": table_out,
@@ -1839,6 +2022,390 @@ pub fn dispatch_tool_call(
             };
 
             CallToolResult::text(script)
+        }
+        "memory_read_batch" => {
+            let reads = match args.get("reads").and_then(|v| v.as_array()) {
+                Some(r) => r,
+                None => return CallToolResult::error("Missing parameter 'reads' array"),
+            };
+
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("Not attached to any process. Call process_attach first.");
+            }
+
+            let modules = pal.enumerate_modules().unwrap_or_default();
+            let mut results = Vec::new();
+
+            for item in reads {
+                let tag = item.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let val_type = item.get("val_type").and_then(|v| v.as_str()).unwrap_or("i32");
+                let default_size = match val_type {
+                    "i8" | "u8" | "byte" => 1,
+                    "i16" | "u16" | "short" => 2,
+                    "i32" | "u32" | "f32" | "int" | "float" => 4,
+                    "i64" | "u64" | "f64" | "long" | "double" | "pointer" | "ptr" => 8,
+                    "string" => 64,
+                    _ => 4,
+                };
+                let size = item.get("size").and_then(|v| v.as_u64()).map(|s| s as usize).unwrap_or(default_size);
+
+                let target_addr_res: Result<Address, String> = if let Some(addr_str) = item.get("address").and_then(|v| v.as_str()) {
+                    parse_hex_or_dec_address(addr_str).ok_or_else(|| format!("Invalid address: '{addr_str}'"))
+                } else if let Some(chain) = item.get("chain").and_then(|v| v.as_object()) {
+                    let mod_name = chain.get("module").and_then(|v| v.as_str()).unwrap_or("");
+                    let base_off_str = chain.get("base_offset").and_then(|v| v.as_str()).unwrap_or("0");
+                    let base_off = parse_hex_or_dec_address(base_off_str).map(|a| a.as_u64()).unwrap_or(0);
+
+                    let mut chain_offsets = Vec::new();
+                    if let Some(offs) = chain.get("offsets").and_then(|v| v.as_array()) {
+                        for o in offs {
+                            if let Some(s) = o.as_str() {
+                                if let Some(a) = parse_hex_or_dec_address(s) {
+                                    chain_offsets.push(a.as_u64() as i64);
+                                }
+                            } else if let Some(n) = o.as_i64() {
+                                chain_offsets.push(n);
+                            }
+                        }
+                    }
+
+                    let target_mod = modules.iter().find(|m| m.name.eq_ignore_ascii_case(mod_name) || m.name.to_lowercase().contains(&mod_name.to_lowercase()));
+                    match target_mod {
+                        Some(m) => {
+                            let path = PointerPath {
+                                module_name: m.name.clone(),
+                                base_offset: base_off,
+                                offsets: chain_offsets,
+                            };
+                            path.resolve(&**pal, m.base_address, pal.architecture()).map_err(|e| e.to_string())
+                        }
+                        None => Err(format!("Module '{mod_name}' not found")),
+                    }
+                } else {
+                    Err("Must specify either 'address' or 'chain'".to_string())
+                };
+
+                match target_addr_res {
+                    Ok(addr) => {
+                        match pal.read_raw(addr, size) {
+                            Ok(bytes) => {
+                                let val = match val_type {
+                                    "i8" if !bytes.is_empty() => json!(bytes[0] as i8),
+                                    "u8" | "byte" if !bytes.is_empty() => json!(bytes[0]),
+                                    "i16" | "short" if bytes.len() >= 2 => json!(i16::from_le_bytes(bytes[..2].try_into().unwrap_or([0; 2]))),
+                                    "u16" if bytes.len() >= 2 => json!(u16::from_le_bytes(bytes[..2].try_into().unwrap_or([0; 2]))),
+                                    "i32" | "int" if bytes.len() >= 4 => json!(i32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                                    "u32" if bytes.len() >= 4 => json!(u32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                                    "f32" | "float" if bytes.len() >= 4 => json!(f32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4]))),
+                                    "i64" | "long" if bytes.len() >= 8 => json!(i64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                                    "u64" if bytes.len() >= 8 => json!(u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                                    "f64" | "double" if bytes.len() >= 8 => json!(f64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))),
+                                    "pointer" | "ptr" if bytes.len() >= 8 => json!(format!("0x{:X}", u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8])))),
+                                    "pointer" | "ptr" if bytes.len() >= 4 => json!(format!("0x{:X}", u32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4])))),
+                                    "string" => json!(String::from_utf8_lossy(&bytes).trim_matches('\0')),
+                                    _ => {
+                                        let hex_str = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                                        json!(hex_str)
+                                    }
+                                };
+                                let hex_str = bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                                results.push(json!({
+                                    "tag": tag,
+                                    "address": format!("0x{:X}", addr.as_u64()),
+                                    "value": val,
+                                    "raw_hex": hex_str,
+                                    "success": true
+                                }));
+                            }
+                            Err(e) => {
+                                results.push(json!({
+                                    "tag": tag,
+                                    "address": format!("0x{:X}", addr.as_u64()),
+                                    "error": format!("Read error: {e}"),
+                                    "success": false
+                                }));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        results.push(json!({
+                            "tag": tag,
+                            "error": e,
+                            "success": false
+                        }));
+                    }
+                }
+            }
+
+            CallToolResult::json(&json!({
+                "count": results.len(),
+                "results": results
+            })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+        }
+        "module_list" => {
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("Not attached to any process. Call process_attach first.");
+            }
+
+            let filter = args.get("filter").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+            let mut modules = match pal.enumerate_modules() {
+                Ok(m) => m,
+                Err(e) => return CallToolResult::error(format!("Failed to enumerate modules: {e}")),
+            };
+
+            if let Some(ref f) = filter {
+                modules.retain(|m| m.name.to_lowercase().contains(f) || m.path.to_lowercase().contains(f));
+            }
+
+            let mut out_modules = Vec::new();
+            for m in modules {
+                let bin_info = if !m.path.is_empty() && std::path::Path::new(&m.path).exists() {
+                    inspect_module(std::path::Path::new(&m.path), Some(m.base_address)).ok()
+                } else {
+                    None
+                };
+
+                let sections = bin_info.as_ref().map(|i| {
+                    i.sections.iter().map(|s| json!({
+                        "name": s.name,
+                        "runtime_address": format!("0x{:X}", s.address.as_u64()),
+                        "size": s.size,
+                        "executable": s.is_executable,
+                        "writable": s.is_writable
+                    })).collect::<Vec<_>>()
+                });
+
+                out_modules.push(json!({
+                    "name": m.name,
+                    "base_address": format!("0x{:X}", m.base_address.as_u64()),
+                    "size": m.size,
+                    "path": m.path,
+                    "is_pie": bin_info.as_ref().map(|i| i.is_pie),
+                    "entry_point": bin_info.as_ref().map(|i| format!("0x{:X}", i.entry_point.as_u64())),
+                    "sections": sections
+                }));
+            }
+
+            CallToolResult::json(&json!({
+                "count": out_modules.len(),
+                "modules": out_modules
+            })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+        }
+        "symbol_lookup" => {
+            let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return CallToolResult::error("Missing parameter 'pattern'"),
+            };
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("Not attached to any process. Call process_attach first.");
+            }
+
+            let modules = pal.enumerate_modules().unwrap_or_default();
+            let module_req = args.get("module").and_then(|v| v.as_str());
+
+            let (mod_name, mod_path, mod_base) = if let Some(req) = module_req {
+                if let Some(m) = modules.iter().find(|m| m.name.eq_ignore_ascii_case(req) || m.name.to_lowercase().contains(&req.to_lowercase())) {
+                    (m.name.clone(), m.path.clone(), m.base_address)
+                } else if std::path::Path::new(req).exists() {
+                    let name = std::path::Path::new(req).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| req.to_string());
+                    (name, req.to_string(), Address::NULL)
+                } else {
+                    return CallToolResult::error(format!("Module '{req}' not found"));
+                }
+            } else {
+                if let Some(m) = modules.first() {
+                    (m.name.clone(), m.path.clone(), m.base_address)
+                } else {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let pid = pal.attached_pid().unwrap_or(0);
+                        let exe_link = format!("/proc/{pid}/exe");
+                        let resolved_path = std::fs::read_link(&exe_link)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or(exe_link);
+                        ("main_binary".to_string(), resolved_path, Address::NULL)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        return CallToolResult::error("No modules found in target process");
+                    }
+                }
+            };
+
+            let path_obj = std::path::Path::new(&mod_path);
+            if !path_obj.exists() {
+                return CallToolResult::error(format!("Binary file '{mod_path}' does not exist on disk for symbol reading"));
+            }
+
+            match lookup_symbols(path_obj, Some(mod_base), pattern, limit) {
+                Ok(symbols) => {
+                    let formatted_symbols: Vec<Value> = symbols.into_iter().map(|s| {
+                        json!({
+                            "name": s.name,
+                            "runtime_address": format!("0x{:X}", s.address.as_u64()),
+                            "file_address": format!("0x{:X}", s.file_address),
+                            "size": s.size,
+                            "kind": s.kind,
+                            "binding": s.binding,
+                            "section": s.section
+                        })
+                    }).collect();
+
+                    CallToolResult::json(&json!({
+                        "module": mod_name,
+                        "path": mod_path,
+                        "base_address": format!("0x{:X}", mod_base.as_u64()),
+                        "pattern": pattern,
+                        "count": formatted_symbols.len(),
+                        "symbols": formatted_symbols
+                    })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+                Err(e) => CallToolResult::error(format!("Symbol lookup failed: {e}")),
+            }
+        }
+        "struct_layout" => {
+            let list_all = args.get("list_all").and_then(|v| v.as_bool()).unwrap_or(false);
+            let name_req = args.get("name").and_then(|v| v.as_str());
+
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("Not attached to any process. Call process_attach first.");
+            }
+
+            let modules = pal.enumerate_modules().unwrap_or_default();
+            let module_req = args.get("module").and_then(|v| v.as_str());
+
+            let mod_path = if let Some(req) = module_req {
+                if let Some(m) = modules.iter().find(|m| m.name.eq_ignore_ascii_case(req) || m.name.to_lowercase().contains(&req.to_lowercase())) {
+                    m.path.clone()
+                } else if std::path::Path::new(req).exists() {
+                    req.to_string()
+                } else {
+                    return CallToolResult::error(format!("Module '{req}' not found"));
+                }
+            } else {
+                if let Some(m) = modules.first() {
+                    m.path.clone()
+                } else {
+                    #[cfg(target_os = "linux")]
+                    {
+                        let pid = pal.attached_pid().unwrap_or(0);
+                        let exe_link = format!("/proc/{pid}/exe");
+                        std::fs::read_link(&exe_link)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or(exe_link)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        return CallToolResult::error("No modules found in target process");
+                    }
+                }
+            };
+
+            let path_obj = std::path::Path::new(&mod_path);
+            if !path_obj.exists() {
+                return CallToolResult::error(format!("Binary file '{mod_path}' not found on disk"));
+            }
+
+            if list_all {
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+                match list_dwarf_structs(path_obj, limit) {
+                    Ok(names) => CallToolResult::json(&json!({
+                        "module_path": mod_path,
+                        "count": names.len(),
+                        "structs": names
+                    })).unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                    Err(e) => CallToolResult::error(format!("Failed to list DWARF structures: {e}")),
+                }
+            } else {
+                let struct_name = match name_req {
+                    Some(n) => n,
+                    None => return CallToolResult::error("Missing parameter 'name' (or set 'list_all: true')"),
+                };
+
+                match inspect_dwarf_struct(path_obj, struct_name) {
+                    Ok(layout) => {
+                        let cpp_decl = layout.format_cpp_definition();
+                        CallToolResult::json(&json!({
+                            "name": layout.name,
+                            "total_size": layout.total_size,
+                            "fields_count": layout.members.len(),
+                            "fields": layout.members.iter().map(|f| json!({
+                                "name": f.name,
+                                "offset": f.offset_hex,
+                                "offset_dec": f.offset,
+                                "type_name": f.type_name,
+                                "size_bytes": f.size
+                            })).collect::<Vec<_>>(),
+                            "cpp_definition": cpp_decl
+                        })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                    }
+                    Err(e) => CallToolResult::error(format!("DWARF inspection error: {e}")),
+                }
+            }
+        }
+        "struct_diff" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing parameter 'address'"),
+            };
+            let target_addr = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address: '{addr_str}'")),
+            };
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(256) as usize;
+
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("Not attached to any process. Call process_attach first.");
+            }
+
+            let initial_bytes = match pal.read_raw(target_addr, size) {
+                Ok(b) => b,
+                Err(e) => return CallToolResult::error(format!("Failed to read memory: {e}")),
+            };
+
+            if let Some(dur_ms) = args.get("duration_ms").and_then(|v| v.as_u64()) {
+                drop(pal);
+                std::thread::sleep(std::time::Duration::from_millis(dur_ms));
+                let pal = pal_arc.lock().unwrap();
+                let second_bytes = match pal.read_raw(target_addr, size) {
+                    Ok(b) => b,
+                    Err(e) => return CallToolResult::error(format!("Failed to read memory after duration: {e}")),
+                };
+
+                let diff = compute_struct_diff(target_addr, &initial_bytes, &second_bytes);
+                CallToolResult::json(&diff).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+            } else if let Some(snap_id) = args.get("snapshot_id").and_then(|v| v.as_str()) {
+                let mut snaps = snapshots_arc.lock().unwrap();
+                let previous = snaps.get(snap_id).cloned();
+                if let Some((old_addr, old_bytes)) = previous {
+                    let diff = compute_struct_diff(target_addr, &old_bytes, &initial_bytes);
+                    snaps.insert(snap_id.to_string(), (target_addr, initial_bytes));
+                    CallToolResult::json(&json!({
+                        "snapshot_id": snap_id,
+                        "compared_with_previous": true,
+                        "old_address": format!("0x{:X}", old_addr.as_u64()),
+                        "diff": diff
+                    })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                } else {
+                    snaps.insert(snap_id.to_string(), (target_addr, initial_bytes));
+                    CallToolResult::json(&json!({
+                        "snapshot_id": snap_id,
+                        "status": "baseline_saved",
+                        "address": format!("0x{:X}", target_addr.as_u64()),
+                        "size": size,
+                        "message": format!("Baseline snapshot '{snap_id}' saved. Perform the in-game action and call struct_diff again with snapshot_id '{snap_id}' to see changes.")
+                    })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+            } else {
+                CallToolResult::error("Either 'duration_ms' or 'snapshot_id' must be specified for struct_diff")
+            }
         }
         _ => CallToolResult::error(format!("Unknown tool: '{name}'")),
     }
