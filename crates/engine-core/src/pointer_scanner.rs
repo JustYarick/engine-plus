@@ -27,24 +27,32 @@ impl PointerMap {
         }
     }
 
-    /// Build a pointer map by scanning all readable memory regions
+    /// Build a pointer map by scanning memory regions.
+    /// When `writable_only` is true (default for pointer scanning), only readable+writable
+    /// regions (heap, .data, .bss) are scanned, filtering out code (.text) and constants (.rodata).
     pub fn build_from_memory(
         pal: &dyn ProcessAccessLayer,
         regions: &[MemoryRegion],
         pointer_size: usize,
         alignment: usize,
+        writable_only: bool,
     ) -> CoreResult<Self> {
         let align = alignment.max(1);
         let mut entries = Vec::new();
 
-        // Build quick lookup for valid target ranges
+        // Build quick lookup for valid target ranges (any readable memory)
         let valid_ranges: Vec<(u64, u64)> = regions
             .iter()
             .filter(|r| r.is_readable())
             .map(|r| (r.start.as_u64(), r.end.as_u64()))
             .collect();
 
-        for r in regions.iter().filter(|r| r.is_readable()) {
+        // Pointers to dynamic/heap data can only exist in writable memory
+        let regions_to_scan = regions
+            .iter()
+            .filter(|r| r.is_readable() && (!writable_only || r.is_writable()));
+
+        for r in regions_to_scan {
             // Read in blocks up to 512KB
             let chunk_size = 512 * 1024;
             let mut offset = 0;
@@ -182,6 +190,13 @@ pub struct PointerScannerConfig {
     pub max_offset: usize,
     /// Maximum number of paths to collect
     pub max_results: usize,
+    /// Only scan writable memory regions (default: true)
+    #[serde(default = "default_writable_only")]
+    pub writable_only: bool,
+}
+
+fn default_writable_only() -> bool {
+    true
 }
 
 impl Default for PointerScannerConfig {
@@ -190,7 +205,43 @@ impl Default for PointerScannerConfig {
             max_depth: 3,
             max_offset: 4096,
             max_results: 50,
+            writable_only: true,
         }
+    }
+}
+
+/// Helper to rank modules for pointer scanning:
+/// 0 = Main executable binary (first module in list)
+/// 1 = Game / application modules (not in system or driver path)
+/// 2 = System / driver libraries (nvidia, mesa, glcore, gpucomp, vulkan, drm, libc, etc.)
+pub fn module_rank(module_name: &str, is_first: bool) -> u8 {
+    let lower = module_name.to_lowercase();
+
+    let is_driver_or_system = lower.contains("nvidia")
+        || lower.contains("glcore")
+        || lower.contains("gpucomp")
+        || lower.contains("mesa")
+        || lower.contains("vulkan")
+        || lower.contains("drm")
+        || lower.contains("memfd")
+        || lower.contains(".gl")
+        || lower.contains("(deleted)")
+        || lower.contains("libc.")
+        || lower.contains("libc-")
+        || lower.contains("libm.")
+        || lower.contains("libpthread")
+        || lower.contains("libdl")
+        || lower.contains("ld-linux")
+        || lower.contains("libstdc++")
+        || lower.contains("system32")
+        || lower.contains("syswow64");
+
+    if is_driver_or_system {
+        2
+    } else if is_first {
+        0
+    } else {
+        1
     }
 }
 
@@ -209,9 +260,13 @@ impl PointerScanner {
         let mut results = Vec::new();
         let mut seen_paths = HashSet::new();
 
-        let module_ranges: Vec<(&ModuleInfo, u64, u64)> = modules
+        let module_ranges: Vec<(&ModuleInfo, u64, u64, u8)> = modules
             .iter()
-            .map(|m| (m, m.base_address.as_u64(), m.base_address.as_u64() + m.size as u64))
+            .enumerate()
+            .map(|(idx, m)| {
+                let rank = module_rank(&m.name, idx == 0);
+                (m, m.base_address.as_u64(), m.base_address.as_u64() + m.size as u64, rank)
+            })
             .collect();
 
         // Iterative deepening: search depth 1 first, then 2, ..., up to max_depth
@@ -237,11 +292,22 @@ impl PointerScanner {
             );
         }
 
-        // Sort results: shortest chains first, then lowest base offset
+        // Sort results:
+        // 1. Shortest chains first (e.g. 1 offset before 2 offsets before 3 offsets)
+        // 2. Main binary / game modules before system/driver libraries
+        // 3. Lowest base offset
+        // 4. Alphabetical module name
         results.sort_by(|a, b| {
             a.offsets
                 .len()
                 .cmp(&b.offsets.len())
+                .then_with(|| {
+                    let a_first = modules.first().is_some_and(|m| m.name == a.module_name);
+                    let b_first = modules.first().is_some_and(|m| m.name == b.module_name);
+                    let rank_a = module_rank(&a.module_name, a_first);
+                    let rank_b = module_rank(&b.module_name, b_first);
+                    rank_a.cmp(&rank_b)
+                })
                 .then_with(|| a.base_offset.cmp(&b.base_offset))
                 .then_with(|| a.module_name.cmp(&b.module_name))
         });
@@ -252,7 +318,7 @@ impl PointerScanner {
     #[allow(clippy::too_many_arguments)]
     fn search_backward(
         map: &PointerMap,
-        modules: &[(&ModuleInfo, u64, u64)],
+        modules: &[(&ModuleInfo, u64, u64, u8)],
         current_target: Address,
         current_depth: usize,
         depth_limit: usize,
@@ -275,11 +341,16 @@ impl PointerScanner {
             .iter()
             .collect();
 
-        // Partition candidates so static module pointers are checked FIRST
+        // Partition candidates so static module pointers are checked FIRST,
+        // with higher-priority modules (main binary) prioritized over driver/system libraries
         candidates.sort_by_key(|entry| {
             let src = entry.source.as_u64();
-            let is_static = modules.iter().any(|(_, start, end)| src >= *start && src < *end);
-            !is_static // static modules first (false < true)
+            let rank = modules
+                .iter()
+                .find(|(_, start, end, _)| src >= *start && src < *end)
+                .map(|(_, _, _, r)| *r)
+                .unwrap_or(255);
+            rank
         });
 
         for entry in candidates {
@@ -293,9 +364,9 @@ impl PointerScanner {
             let source_u64 = entry.source.as_u64();
             let static_module = modules
                 .iter()
-                .find(|(_, start, end)| source_u64 >= *start && source_u64 < *end);
+                .find(|(_, start, end, _)| source_u64 >= *start && source_u64 < *end);
 
-            if let Some((module, start, _)) = static_module {
+            if let Some((module, start, _, _)) = static_module {
                 let mut path_offsets = current_offsets.clone();
                 path_offsets.push(delta);
                 path_offsets.reverse();
@@ -312,6 +383,9 @@ impl PointerScanner {
                         return;
                     }
                 }
+
+                // A static module variable is a root; do not search deeper from this address
+                continue;
             }
 
             // Continue searching one level deeper if not visited on this branch
@@ -456,6 +530,7 @@ mod tests {
             max_depth: 3,
             max_offset: 1024,
             max_results: 10,
+            writable_only: true,
         };
 
         let paths = PointerScanner::scan(&map, &modules, target, &config);
@@ -505,6 +580,7 @@ mod tests {
             max_depth: 3,
             max_offset: 1024,
             max_results: 10,
+            writable_only: true,
         };
 
         let paths = PointerScanner::scan(&map, &modules, target, &config);
@@ -513,6 +589,48 @@ mod tests {
         assert_eq!(paths[0].offsets.len(), 1, "Shortest chain must come first");
         assert_eq!(paths[0].base_offset, 0x1A3518);
         assert_eq!(paths[0].offsets, vec![0x100]);
+    }
+
+    #[test]
+    fn test_driver_deprioritization() {
+        // Test that if both main binary and driver module (e.g. nvidia) have chains of equal depth,
+        // main binary is prioritized over the driver library
+        let entries = vec![
+            // Driver chain: libnvidia-gpucomp.so + 0x100 -> +0x20
+            PointerEntry { source: Address::new(0x7F000000 + 0x100), target: Address::new(0x286A760) },
+            // Main binary chain: linux_64_client + 0x200 -> +0x20
+            PointerEntry { source: Address::new(0x400000 + 0x200), target: Address::new(0x286A760) },
+        ];
+
+        let map = PointerMap::new(entries, 8);
+        let modules = vec![
+            ModuleInfo {
+                name: "linux_64_client".to_string(),
+                path: "/game/linux_64_client".to_string(),
+                base_address: Address::new(0x400000),
+                size: 0x200000,
+            },
+            ModuleInfo {
+                name: "libnvidia-gpucomp.so".to_string(),
+                path: "/usr/lib64/libnvidia-gpucomp.so".to_string(),
+                base_address: Address::new(0x7F000000),
+                size: 0x1000000,
+            },
+        ];
+
+        let target = Address::new(0x286A780);
+        let config = PointerScannerConfig {
+            max_depth: 2,
+            max_offset: 1024,
+            max_results: 10,
+            writable_only: true,
+        };
+
+        let paths = PointerScanner::scan(&map, &modules, target, &config);
+        assert_eq!(paths.len(), 2);
+        // linux_64_client must be first, despite having a larger base offset (0x200 > 0x100)
+        assert_eq!(paths[0].module_name, "linux_64_client");
+        assert_eq!(paths[1].module_name, "libnvidia-gpucomp.so");
     }
 }
 

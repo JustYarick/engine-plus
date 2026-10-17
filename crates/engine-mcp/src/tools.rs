@@ -505,6 +505,7 @@ pub fn list_tools() -> Vec<Tool> {
                     "max_offset": { "type": "integer", "default": 4096, "description": "Maximum struct offset in bytes (e.g. 4096)" },
                     "alignment": { "type": "integer", "default": 8, "description": "Memory alignment for pointer values (4 or 8)" },
                     "max_results": { "type": "integer", "default": 50, "description": "Maximum number of pointer paths to return" },
+                    "writable_only": { "type": "boolean", "default": true, "description": "Only scan writable memory regions (.data, .bss, heap), excluding read-only code/constants (default: true)" },
                     "module_filter": { "type": "string", "description": "Optional module name filter (e.g. 'ac_client')" }
                 },
                 "required": ["target_address"]
@@ -1856,6 +1857,7 @@ pub fn dispatch_tool_call(
             let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
             let max_offset = args.get("max_offset").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
             let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let writable_only = args.get("writable_only").and_then(|v| v.as_bool()).unwrap_or(true);
             let module_filter = args.get("module_filter").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
 
             let pal = pal_arc.lock().unwrap();
@@ -1880,7 +1882,7 @@ pub fn dispatch_tool_call(
             let ptr_size = pal.architecture().pointer_size();
             let align = args.get("alignment").and_then(|v| v.as_u64()).map(|a| a as usize).unwrap_or(ptr_size);
 
-            let map = match PointerMap::build_from_memory(&**pal, &regions, ptr_size, align) {
+            let map = match PointerMap::build_from_memory(&**pal, &regions, ptr_size, align, writable_only) {
                 Ok(m) => m,
                 Err(e) => return CallToolResult::error(format!("Failed to build pointer map: {e}")),
             };
@@ -1889,6 +1891,7 @@ pub fn dispatch_tool_call(
                 max_depth,
                 max_offset,
                 max_results,
+                writable_only,
             };
 
             let paths = PointerScanner::scan(&map, &modules, target_addr, &config);

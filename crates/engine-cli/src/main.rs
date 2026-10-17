@@ -2,7 +2,7 @@ mod repl;
 
 use clap::{Parser, Subcommand};
 use engine_core::{FirstScanMode, MemoryScanner, ScanConfig, ScanValue, ScanValueType};
-use engine_pal::{default_backend, default_enumerator, Address, ProcessId, ProtectionFlags};
+use engine_pal::{default_backend, default_enumerator, Address, MemoryReader, ProcessId, ProtectionFlags};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use repl::InteractiveConsole;
 use std::path::PathBuf;
@@ -69,13 +69,13 @@ enum Commands {
         #[arg(short, long)]
         address: String,
 
-        /// Value type: i32, u32, i64, u64, f32, f64, hex, string
+        /// Value type: i8, u8, i16, u16, i32, u32, i64, u64, f32, f64, hex, string
         #[arg(short = 't', long, default_value = "i32")]
         val_type: String,
 
-        /// Number of bytes to read
-        #[arg(short, long, default_value = "4")]
-        size: usize,
+        /// Number of bytes to read (defaults automatically according to type)
+        #[arg(short, long)]
+        size: Option<usize>,
     },
 
     /// Write typed value or raw hex bytes to target memory address
@@ -374,6 +374,85 @@ enum Commands {
         #[arg(long)]
         platform: Option<String>,
     },
+
+    /// Enumerate loaded modules and binaries in target process
+    Modules {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        /// Optional substring filter for module name or path
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+
+    /// Lookup functions and symbols via symbol tables and DWARF debug info
+    Symbols {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        /// Substring pattern to search for (e.g. 'player', 'health')
+        #[arg(short = 's', long)]
+        pattern: String,
+
+        /// Optional module name or binary path (defaults to main executable)
+        #[arg(short, long)]
+        module: Option<String>,
+
+        /// Maximum results to display
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Inspect struct memory layout or list structs from DWARF debug info
+    StructLayout {
+        /// Process ID (inspects module in running process)
+        #[arg(short, long)]
+        pid: Option<ProcessId>,
+
+        /// Direct binary path on disk (alternative to --pid)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Structure name to inspect layout of (e.g. 'playerent')
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// List all structure names found in DWARF debug symbols
+        #[arg(short = 'l', long)]
+        list_all: bool,
+
+        /// Maximum structures to list
+        #[arg(long, default_value = "100")]
+        limit: usize,
+    },
+
+    /// Compare memory structure over time to identify changing fields
+    Diff {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        /// Memory address of structure to monitor (e.g. '0x6F7B630')
+        #[arg(short, long)]
+        address: String,
+
+        /// Structure size in bytes
+        #[arg(short, long, default_value = "128")]
+        size: usize,
+
+        /// Delay between memory samples in milliseconds
+        #[arg(short, long, default_value = "500")]
+        interval_ms: u64,
+    },
+
+    /// Batch read multiple addresses and pointer chains in a single pass
+    Batch {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        /// Address or pointer chain expressions (e.g. '0x5A3518:u64', 'linux_64_client+0x1A3518->+0x100:i32')
+        #[arg(short, long, num_args = 1..)]
+        items: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -526,11 +605,23 @@ async fn main() -> anyhow::Result<()> {
             let addr = parse_hex_or_dec_val(&address)
                 .ok_or_else(|| anyhow::anyhow!("Invalid address '{address}'"))?;
 
+            let read_size = size.unwrap_or_else(|| match val_type.to_lowercase().as_str() {
+                "i8" | "u8" => 1,
+                "i16" | "u16" => 2,
+                "i64" | "u64" | "f64" => 8,
+                "string" => 32,
+                _ => 4,
+            });
+
             let mut pal = default_backend();
             pal.attach(pid)?;
 
-            let bytes = pal.read_raw(Address::new(addr), size)?;
+            let bytes = pal.read_raw(Address::new(addr), read_size)?;
             match val_type.to_lowercase().as_str() {
+                "i8" if !bytes.is_empty() => println!("{}: {}", address, bytes[0] as i8),
+                "u8" if !bytes.is_empty() => println!("{}: {} (0x{:02X})", address, bytes[0], bytes[0]),
+                "i16" if bytes.len() >= 2 => println!("{}: {}", address, i16::from_le_bytes(bytes[..2].try_into().unwrap())),
+                "u16" if bytes.len() >= 2 => println!("{}: {}", address, u16::from_le_bytes(bytes[..2].try_into().unwrap())),
                 "i32" if bytes.len() >= 4 => println!("{}: {}", address, i32::from_le_bytes(bytes[..4].try_into().unwrap())),
                 "u32" if bytes.len() >= 4 => println!("{}: {}", address, u32::from_le_bytes(bytes[..4].try_into().unwrap())),
                 "i64" if bytes.len() >= 8 => println!("{}: {}", address, i64::from_le_bytes(bytes[..8].try_into().unwrap())),
@@ -549,11 +640,16 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Invalid address '{address}'"))?;
 
             let bytes = match val_type.to_lowercase().as_str() {
+                "i8" => vec![value.parse::<i8>()? as u8],
+                "u8" => vec![value.parse::<u8>()?],
+                "i16" => value.parse::<i16>()?.to_le_bytes().to_vec(),
+                "u16" => value.parse::<u16>()?.to_le_bytes().to_vec(),
                 "i32" => value.parse::<i32>()?.to_le_bytes().to_vec(),
                 "u32" => value.parse::<u32>()?.to_le_bytes().to_vec(),
                 "f32" => value.parse::<f32>()?.to_le_bytes().to_vec(),
                 "i64" => value.parse::<i64>()?.to_le_bytes().to_vec(),
                 "u64" => value.parse::<u64>()?.to_le_bytes().to_vec(),
+                "f64" => value.parse::<f64>()?.to_le_bytes().to_vec(),
                 "hex" => {
                     let mut b = Vec::new();
                     for t in value.split_whitespace() {
@@ -950,8 +1046,8 @@ async fn main() -> anyhow::Result<()> {
             println!("Building pointer map of target process (PID: {pid})...");
             let regions = pal.query_regions()?;
             let ptr_size = pal.architecture().pointer_size();
-            let pmap = engine_core::PointerMap::build_from_memory(&*pal, &regions, ptr_size, ptr_size)?;
-            println!("Indexed {} pointers across readable regions", pmap.total_pointers());
+            let pmap = engine_core::PointerMap::build_from_memory(&*pal, &regions, ptr_size, ptr_size, true)?;
+            println!("Indexed {} pointers across writable regions", pmap.total_pointers());
 
             let modules = pal.enumerate_modules().unwrap_or_default();
             println!("Scanning for pointer chains to 0x{:X} (Depth: 1..={}, Max Offset: 0x{:X})...", target_addr, depth, max_off);
@@ -960,6 +1056,7 @@ async fn main() -> anyhow::Result<()> {
                 max_depth: depth,
                 max_offset: max_off,
                 max_results: limit.max(50),
+                writable_only: true,
             };
             let paths = engine_core::PointerScanner::scan(&pmap, &modules, Address::new(target_addr), &config);
             println!("Scan complete: Found {} pointer chain(s)", paths.len());
@@ -1035,6 +1132,196 @@ async fn main() -> anyhow::Result<()> {
                 println!("  Virtual Time: {:.3} s", virt_time as f64 / 1_000_000_000.0);
             }
         }
+        Some(Commands::Modules { pid, filter }) => {
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let mut modules = pal.enumerate_modules()?;
+            if let Some(ref f) = filter {
+                let fl = f.to_lowercase();
+                modules.retain(|m| m.name.to_lowercase().contains(&fl) || m.path.to_lowercase().contains(&fl));
+            }
+            println!("Loaded modules in process {pid} (Count: {}):", modules.len());
+            println!("{:<32} | {:>18} | {:>10} | Path", "Module Name", "Base Address", "Size");
+            println!("{:-<32}-+-{:-<18}-+-{:-<10}-+-{:-<40}", "", "", "", "");
+            for m in &modules {
+                println!("{:<32} | 0x{:016X} | 0x{:08X} | {}", m.name, m.base_address.as_u64(), m.size, m.path);
+            }
+        }
+        Some(Commands::Symbols { pid, pattern, module, limit }) => {
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let modules = pal.enumerate_modules()?;
+            let (mod_name, mod_path, mod_base) = if let Some(ref req) = module {
+                if let Some(m) = modules.iter().find(|m| m.name.eq_ignore_ascii_case(req) || m.name.to_lowercase().contains(&req.to_lowercase())) {
+                    (m.name.clone(), m.path.clone(), m.base_address)
+                } else if std::path::Path::new(req).exists() {
+                    (req.clone(), req.clone(), Address::NULL)
+                } else {
+                    anyhow::bail!("Module '{req}' not found");
+                }
+            } else if let Some(m) = modules.first() {
+                (m.name.clone(), m.path.clone(), m.base_address)
+            } else {
+                anyhow::bail!("No modules found in target process");
+            };
+
+            let path_obj = std::path::Path::new(&mod_path);
+            if !path_obj.exists() {
+                anyhow::bail!("Binary file '{mod_path}' does not exist on disk for symbol reading");
+            }
+
+            let symbols = engine_core::lookup_symbols(path_obj, Some(mod_base), &pattern, limit)?;
+            println!("Found {} symbol(s) matching '{pattern}' in {mod_name}:", symbols.len());
+            println!("{:>18} | {:>10} | {:<8} | {:<8} | {:<12} | Name", "Runtime Addr", "Size", "Kind", "Binding", "Section");
+            println!("{:-<18}-+-{:-<10}-+-{:-<8}-+-{:-<8}-+-{:-<12}-+-{:-<30}", "", "", "", "", "", "");
+            for s in &symbols {
+                let sec = s.section.as_deref().unwrap_or("-");
+                println!("0x{:016X} | 0x{:08X} | {:<8} | {:<8} | {:<12} | {}", s.address.as_u64(), s.size, s.kind, s.binding, sec, s.name);
+            }
+        }
+        Some(Commands::StructLayout { pid, path, name, list_all, limit }) => {
+            let file_path = if let Some(p) = path {
+                p
+            } else if let Some(pid) = pid {
+                let mut pal = default_backend();
+                pal.attach(pid)?;
+                let modules = pal.enumerate_modules()?;
+                if let Some(m) = modules.first() {
+                    PathBuf::from(&m.path)
+                } else {
+                    anyhow::bail!("No module path found for PID {pid}");
+                }
+            } else {
+                anyhow::bail!("Please specify either --pid <PID> or --path <BINARY_PATH>");
+            };
+
+            if list_all {
+                let names = engine_core::list_dwarf_structs(&file_path, limit)?;
+                println!("Found {} structure(s) in DWARF debug info for '{}':", names.len(), file_path.display());
+                for n in &names {
+                    println!("  {n}");
+                }
+            } else if let Some(ref sname) = name {
+                let layout = engine_core::inspect_dwarf_struct(&file_path, sname)?;
+                println!("Structure '{}' (Total Size: {} bytes, {} members):", layout.name, layout.total_size, layout.members.len());
+                println!("{:<10} | {:>6} | {:<24} | Field Name", "Offset", "Size", "Type");
+                println!("{:-<10}-+-{:-<6}-+-{:-<24}-+-{:-<24}", "", "", "", "");
+                for m in &layout.members {
+                    println!("{:<10} | {:>6} | {:<24} | {}", m.offset_hex, m.size, m.type_name, m.name);
+                }
+                println!("\nC++ Struct Definition:\n{}", layout.format_cpp_definition());
+            } else {
+                anyhow::bail!("Please provide a structure name with -n/--name, or pass -l/--list-all");
+            }
+        }
+        Some(Commands::Diff { pid, address, size, interval_ms }) => {
+            let addr_val = parse_hex_or_dec_val(&address)
+                .ok_or_else(|| anyhow::anyhow!("Invalid address '{address}'"))?;
+            let addr = Address::new(addr_val);
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+
+            println!("Monitoring address {addr} (size: {size} bytes)...");
+            let before = pal.read_raw(addr, size)?;
+            println!("Captured baseline snapshot. Waiting {interval_ms} ms...");
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            let after = pal.read_raw(addr, size)?;
+
+            let diffs = engine_core::compute_struct_diff(addr, &before, &after);
+            if diffs.is_empty() {
+                println!("No changes detected during {interval_ms} ms interval.");
+            } else {
+                println!("Detected {} change(s) in structure:", diffs.len());
+                println!("{:<10} | {:<20} -> {:<20} | Summary", "Offset", "Old Bytes", "New Bytes");
+                println!("{:-<10}-+-{:-<20}-+-{:-<20}-+-{:-<30}", "", "", "", "");
+                for d in &diffs {
+                    println!("{:<10} | {:<20} -> {:<20} | {}", d.offset_hex, d.old_bytes_hex, d.new_bytes_hex, d.summary);
+                }
+            }
+        }
+        Some(Commands::Batch { pid, items }) => {
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let modules = pal.enumerate_modules().unwrap_or_default();
+            let arch = pal.architecture();
+
+            println!("Executing batch read of {} item(s) on PID {pid}:", items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let (expr, type_str) = if let Some((e, t)) = item.split_once(':') {
+                    (e.trim(), t.trim())
+                } else {
+                    (item.trim(), "i32")
+                };
+
+                let resolved_addr: Result<Address, anyhow::Error> = if expr.contains("->") {
+                    let parts: Vec<&str> = expr.split("->").map(|s| s.trim()).collect();
+                    let base_part = parts[0];
+                    let mut current_addr = if let Some((mod_name, off_str)) = base_part.split_once('+') {
+                        let base_off = parse_hex_or_dec_val(off_str)
+                            .ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))?;
+                        let m = modules.iter().find(|m| m.name.eq_ignore_ascii_case(mod_name.trim()) || m.name.to_lowercase().contains(&mod_name.to_lowercase()))
+                            .ok_or_else(|| anyhow::anyhow!("Module '{mod_name}' not found"))?;
+                        m.base_address.add(base_off as usize)
+                    } else {
+                        let a = parse_hex_or_dec_val(base_part)
+                            .ok_or_else(|| anyhow::anyhow!("Invalid base address '{base_part}'"))?;
+                        Address::new(a)
+                    };
+
+                    current_addr = pal.read_pointer(current_addr, arch)?;
+                    for (level, &off_str) in parts[1..].iter().enumerate() {
+                        let off = if let Some(s) = off_str.strip_prefix('+') {
+                            parse_hex_or_dec_val(s).ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))? as i64
+                        } else if let Some(s) = off_str.strip_prefix('-') {
+                            -(parse_hex_or_dec_val(s).ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))? as i64)
+                        } else {
+                            parse_hex_or_dec_val(off_str).ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))? as i64
+                        };
+                        let next = current_addr.offset(off);
+                        if level == parts.len() - 2 {
+                            current_addr = next;
+                        } else {
+                            current_addr = pal.read_pointer(next, arch)?;
+                        }
+                    }
+                    Ok(current_addr)
+                } else if let Some((mod_name, off_str)) = expr.split_once('+') {
+                    let base_off = parse_hex_or_dec_val(off_str)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))?;
+                    let m = modules.iter().find(|m| m.name.eq_ignore_ascii_case(mod_name.trim()) || m.name.to_lowercase().contains(&mod_name.to_lowercase()))
+                        .ok_or_else(|| anyhow::anyhow!("Module '{mod_name}' not found"))?;
+                    Ok(m.base_address.add(base_off as usize))
+                } else {
+                    let a = parse_hex_or_dec_val(expr)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid address '{expr}'"))?;
+                    Ok(Address::new(a))
+                };
+
+                match resolved_addr {
+                    Ok(addr) => {
+                        let val_str = match type_str.to_lowercase().as_str() {
+                            "i8" => pal.read_i8(addr).map(|v| format!("{v}")),
+                            "u8" => pal.read_u8(addr).map(|v| format!("{v} (0x{v:02X})")),
+                            "i16" => pal.read_i16(addr).map(|v| format!("{v}")),
+                            "u16" => pal.read_u16(addr).map(|v| format!("{v} (0x{v:04X})")),
+                            "i32" => pal.read_i32(addr).map(|v| format!("{v}")),
+                            "u32" => pal.read_u32(addr).map(|v| format!("{v} (0x{v:08X})")),
+                            "i64" => pal.read_i64(addr).map(|v| format!("{v}")),
+                            "u64" => pal.read_u64(addr).map(|v| format!("{v} (0x{v:016X})")),
+                            "f32" => pal.read_f32(addr).map(|v| format!("{v:.4}")),
+                            "f64" => pal.read_f64(addr).map(|v| format!("{v:.6}")),
+                            "hex" => pal.read_raw(addr, 16).map(|b| b.iter().map(|x| format!("{x:02X}")).collect::<Vec<_>>().join(" ")),
+                            _ => pal.read_i32(addr).map(|v| format!("{v}")),
+                        };
+                        match val_str {
+                            Ok(v) => println!("  [#{}] {} => {} [{}] = {}", idx + 1, expr, addr, type_str, v),
+                            Err(e) => println!("  [#{}] {} => {} [{}] = Error: {}", idx + 1, expr, addr, type_str, e),
+                        }
+                    }
+                    Err(e) => println!("  [#{}] {} => Error: {}", idx + 1, expr, e),
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1086,6 +1373,11 @@ mod tests {
         assert!(Cli::try_parse_from(["engine-plus", "ptr-resolve", "-p", "1234", "-m", "game.exe", "-b", "0x1000", "-o", "0x20", "0xF8"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "speedhack", "-m", "2.5"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "speedhack", "-m", "1.5", "-s"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "modules", "-p", "1234"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "symbols", "-p", "1234", "-s", "player"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "struct-layout", "-p", "1234", "-n", "playerent"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "diff", "-p", "1234", "-a", "0x1000"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "batch", "-p", "1234", "-i", "0x1000:i32"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "--mcp"]).is_ok());
     }
 

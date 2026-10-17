@@ -1,11 +1,12 @@
 use engine_core::{
+    compute_struct_diff, inspect_dwarf_struct, list_dwarf_structs, lookup_symbols,
     BreakpointManager, FirstScanMode, HitTracer, MemoryScanner, NextScanMode, PointerMap,
     PointerPath, PointerScanner, PointerScannerConfig, ScanConfig, ScanValue, ScanValueType,
     SpeedHackScriptGenerator, TimeDilationState,
 };
 use engine_pal::{
-    default_backend, default_enumerator, Address, BreakpointId, ProcessAccessLayer, ProcessId,
-    ProtectionFlags, WatchpointCondition, WatchpointSize,
+    default_backend, default_enumerator, Address, BreakpointId, MemoryReader, ProcessAccessLayer,
+    ProcessId, ProtectionFlags, WatchpointCondition, WatchpointSize,
 };
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use std::io::{self, BufRead, Write};
@@ -127,11 +128,17 @@ impl InteractiveConsole {
                 "read" => {
                     if args.is_empty() {
                         println!("Usage: read <hex_address> [type] [size]");
-                        println!("  Types: i32, u32, i64, u64, f32, f64, hex, string");
+                        println!("  Types: i8, u8, i16, u16, i32, u32, i64, u64, f32, f64, hex, string");
                     } else {
                         let addr_str = args[0];
                         let type_str = args.get(1).copied().unwrap_or("i32");
-                        let size = args.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
+                        let size = args.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or_else(|| match type_str.to_lowercase().as_str() {
+                            "i8" | "u8" => 1,
+                            "i16" | "u16" => 2,
+                            "i64" | "u64" | "f64" => 8,
+                            "string" => 32,
+                            _ => 4,
+                        });
                         self.cmd_read(addr_str, type_str, size)?;
                     }
                 }
@@ -382,6 +389,55 @@ impl InteractiveConsole {
                         println!("Error: Invalid multiplier '{}'", args[0]);
                     }
                 }
+                "modules" | "modlist" => {
+                    let filter = args.first().copied();
+                    self.cmd_modules(filter)?;
+                }
+                "symbols" | "sym" => {
+                    if args.is_empty() {
+                        println!("Usage: symbols <pattern> [module] [limit]");
+                        println!("  Example: symbols player");
+                        println!("  Example: symbols update ac_client 50");
+                    } else {
+                        let pattern = args[0];
+                        let module = args.get(1).copied();
+                        let limit = args.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+                        self.cmd_symbols(pattern, module, limit)?;
+                    }
+                }
+                "structlayout" | "layout" => {
+                    if args.is_empty() {
+                        println!("Usage: structlayout <name|--all> [module]");
+                        println!("  Example: structlayout playerent");
+                        println!("  Example: structlayout --all");
+                    } else if args[0] == "--all" || args[0] == "-a" {
+                        let module = args.get(1).copied();
+                        self.cmd_struct_layout_all(module)?;
+                    } else {
+                        let name = args[0];
+                        let module = args.get(1).copied();
+                        self.cmd_struct_layout(name, module)?;
+                    }
+                }
+                "diff" => {
+                    if args.is_empty() {
+                        println!("Usage: diff <hex_address> [size] [interval_ms]");
+                        println!("  Example: diff 0x6F7B630 128 500");
+                    } else {
+                        let addr = args[0];
+                        let size = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(128);
+                        let interval = args.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(500);
+                        self.cmd_diff(addr, size, interval)?;
+                    }
+                }
+                "batch" => {
+                    if args.is_empty() {
+                        println!("Usage: batch <expr1> [expr2...]");
+                        println!("  Example: batch 0x5A3518:u64 linux_64_client+0x1A3518->+0x100:i32");
+                    } else {
+                        self.cmd_batch(&args)?;
+                    }
+                }
                 _ => {
                     println!("Unknown command: '{cmd}'. Type 'help' for available commands.");
                 }
@@ -397,6 +453,11 @@ impl InteractiveConsole {
         println!("  attach <pid>                - Attach to target process by PID");
         println!("  detach                      - Detach from currently attached process");
         println!("  info                        - Show memory regions, loaded modules & architecture");
+        println!("  modules [filter]            - List loaded modules, base addresses and sizes");
+        println!("  symbols <pat> [mod] [limit] - Lookup functions & symbols via symbol table & DWARF");
+        println!("  structlayout <name|--all>   - Inspect struct layout or list structs from DWARF");
+        println!("  diff <addr> [size] [ms]     - Diff structure in memory over time (detect changing fields)");
+        println!("  batch <expr1> [expr2...]    - Batch read memory and pointer chains in one shot");
         println!("  scan <val> <type> [align]   - Perform first memory scan (e.g. 'scan 100 i32')");
         println!("  next <val|mode>             - Filter scan results (exact, changed, unchanged, increased)");
         println!("  results [limit]             - Display found scan addresses (default 20)");
@@ -596,6 +657,10 @@ impl InteractiveConsole {
 
         let bytes = self.pal.read_raw(Address::new(addr), size)?;
         match type_str.to_lowercase().as_str() {
+            "i8" if !bytes.is_empty() => println!("{}: {}", addr_str, bytes[0] as i8),
+            "u8" if !bytes.is_empty() => println!("{}: {} (0x{:02X})", addr_str, bytes[0], bytes[0]),
+            "i16" if bytes.len() >= 2 => println!("{}: {}", addr_str, i16::from_le_bytes(bytes[..2].try_into().unwrap())),
+            "u16" if bytes.len() >= 2 => println!("{}: {}", addr_str, u16::from_le_bytes(bytes[..2].try_into().unwrap())),
             "i32" if bytes.len() >= 4 => println!("{}: {}", addr_str, i32::from_le_bytes(bytes[..4].try_into().unwrap())),
             "u32" if bytes.len() >= 4 => println!("{}: {}", addr_str, u32::from_le_bytes(bytes[..4].try_into().unwrap())),
             "i64" if bytes.len() >= 8 => println!("{}: {}", addr_str, i64::from_le_bytes(bytes[..8].try_into().unwrap())),
@@ -621,11 +686,16 @@ impl InteractiveConsole {
             .ok_or_else(|| anyhow::anyhow!("Invalid address '{addr_str}'"))?;
 
         let bytes = match type_str.to_lowercase().as_str() {
+            "i8" => vec![val_str.parse::<i8>()? as u8],
+            "u8" => vec![val_str.parse::<u8>()?],
+            "i16" => val_str.parse::<i16>()?.to_le_bytes().to_vec(),
+            "u16" => val_str.parse::<u16>()?.to_le_bytes().to_vec(),
             "i32" => val_str.parse::<i32>()?.to_le_bytes().to_vec(),
             "u32" => val_str.parse::<u32>()?.to_le_bytes().to_vec(),
             "f32" => val_str.parse::<f32>()?.to_le_bytes().to_vec(),
             "i64" => val_str.parse::<i64>()?.to_le_bytes().to_vec(),
             "u64" => val_str.parse::<u64>()?.to_le_bytes().to_vec(),
+            "f64" => val_str.parse::<f64>()?.to_le_bytes().to_vec(),
             "hex" => {
                 let mut b = Vec::new();
                 for t in val_str.split_whitespace() {
@@ -1154,8 +1224,8 @@ impl InteractiveConsole {
         println!("Building pointer map of target process readable memory...");
         let regions = self.pal.query_regions()?;
         let ptr_size = self.pal.architecture().pointer_size();
-        let pmap = PointerMap::build_from_memory(&*self.pal, &regions, ptr_size, ptr_size)?;
-        println!("Pointer map generated: {} pointers indexed across readable regions", pmap.total_pointers());
+        let pmap = PointerMap::build_from_memory(&*self.pal, &regions, ptr_size, ptr_size, true)?;
+        println!("Pointer map generated: {} pointers indexed across writable regions", pmap.total_pointers());
 
         let modules = self.pal.enumerate_modules().unwrap_or_default();
         println!("Scanning for pointer paths to 0x{:X} (Depth: 1..={}, Max Offset: 0x{:X})...", target.as_u64(), max_depth, max_offset);
@@ -1164,6 +1234,7 @@ impl InteractiveConsole {
             max_depth,
             max_offset,
             max_results: limit.max(50),
+            writable_only: true,
         };
         let paths = PointerScanner::scan(&pmap, &modules, target, &config);
         println!("Scan complete: Found {} pointer chain(s)", paths.len());
@@ -1241,6 +1312,221 @@ impl InteractiveConsole {
         println!("{script}");
         println!("------------------------------------------------------------");
         println!("You can apply this script with: aa <paste_script>");
+        Ok(())
+    }
+
+    fn cmd_modules(&mut self, filter: Option<&str>) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let mut modules = self.pal.enumerate_modules()?;
+        if let Some(f) = filter {
+            let fl = f.to_lowercase();
+            modules.retain(|m| m.name.to_lowercase().contains(&fl) || m.path.to_lowercase().contains(&fl));
+        }
+        println!("Loaded modules (Count: {}):", modules.len());
+        println!("{:<32} | {:>18} | {:>10} | Path", "Module Name", "Base Address", "Size");
+        println!("{:-<32}-+-{:-<18}-+-{:-<10}-+-{:-<40}", "", "", "", "");
+        for m in &modules {
+            println!("{:<32} | 0x{:016X} | 0x{:08X} | {}", m.name, m.base_address.as_u64(), m.size, m.path);
+        }
+        Ok(())
+    }
+
+    fn cmd_symbols(&mut self, pattern: &str, module: Option<&str>, limit: usize) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let modules = self.pal.enumerate_modules()?;
+        let (mod_name, mod_path, mod_base) = if let Some(req) = module {
+            if let Some(m) = modules.iter().find(|m| m.name.eq_ignore_ascii_case(req) || m.name.to_lowercase().contains(&req.to_lowercase())) {
+                (m.name.clone(), m.path.clone(), m.base_address)
+            } else if std::path::Path::new(req).exists() {
+                (req.to_string(), req.to_string(), Address::NULL)
+            } else {
+                anyhow::bail!("Module '{req}' not found");
+            }
+        } else if let Some(m) = modules.first() {
+            (m.name.clone(), m.path.clone(), m.base_address)
+        } else {
+            anyhow::bail!("No modules found in target process");
+        };
+
+        let symbols = lookup_symbols(std::path::Path::new(&mod_path), Some(mod_base), pattern, limit)?;
+        println!("Found {} symbol(s) matching '{pattern}' in {mod_name}:", symbols.len());
+        println!("{:>18} | {:>10} | {:<8} | {:<8} | {:<12} | Name", "Runtime Addr", "Size", "Kind", "Binding", "Section");
+        println!("{:-<18}-+-{:-<10}-+-{:-<8}-+-{:-<8}-+-{:-<12}-+-{:-<30}", "", "", "", "", "", "");
+        for s in &symbols {
+            let sec = s.section.as_deref().unwrap_or("-");
+            println!("0x{:016X} | 0x{:08X} | {:<8} | {:<8} | {:<12} | {}", s.address.as_u64(), s.size, s.kind, s.binding, sec, s.name);
+        }
+        Ok(())
+    }
+
+    fn cmd_struct_layout_all(&mut self, module: Option<&str>) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let modules = self.pal.enumerate_modules()?;
+        let mod_path = if let Some(req) = module {
+            if let Some(m) = modules.iter().find(|m| m.name.eq_ignore_ascii_case(req) || m.name.to_lowercase().contains(&req.to_lowercase())) {
+                m.path.clone()
+            } else {
+                req.to_string()
+            }
+        } else if let Some(m) = modules.first() {
+            m.path.clone()
+        } else {
+            anyhow::bail!("No modules found");
+        };
+
+        let names = list_dwarf_structs(std::path::Path::new(&mod_path), 100)?;
+        println!("Found {} structure(s) in DWARF debug info for '{}':", names.len(), mod_path);
+        for n in &names {
+            println!("  {n}");
+        }
+        Ok(())
+    }
+
+    fn cmd_struct_layout(&mut self, name: &str, module: Option<&str>) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let modules = self.pal.enumerate_modules()?;
+        let mod_path = if let Some(req) = module {
+            if let Some(m) = modules.iter().find(|m| m.name.eq_ignore_ascii_case(req) || m.name.to_lowercase().contains(&req.to_lowercase())) {
+                m.path.clone()
+            } else {
+                req.to_string()
+            }
+        } else if let Some(m) = modules.first() {
+            m.path.clone()
+        } else {
+            anyhow::bail!("No modules found");
+        };
+
+        let layout = inspect_dwarf_struct(std::path::Path::new(&mod_path), name)?;
+        println!("Structure '{}' (Total Size: {} bytes, {} members):", layout.name, layout.total_size, layout.members.len());
+        println!("{:<10} | {:>6} | {:<24} | Field Name", "Offset", "Size", "Type");
+        println!("{:-<10}-+-{:-<6}-+-{:-<24}-+-{:-<24}", "", "", "", "");
+        for m in &layout.members {
+            println!("{:<10} | {:>6} | {:<24} | {}", m.offset_hex, m.size, m.type_name, m.name);
+        }
+        println!("\nC++ Struct Definition:\n{}", layout.format_cpp_definition());
+        Ok(())
+    }
+
+    fn cmd_diff(&mut self, addr_str: &str, size: usize, interval_ms: u64) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let addr_val = parse_hex_or_dec(addr_str)
+            .ok_or_else(|| anyhow::anyhow!("Invalid address '{addr_str}'"))?;
+        let addr = Address::new(addr_val);
+
+        println!("Monitoring address {addr} (size: {size} bytes)...");
+        let before = self.pal.read_raw(addr, size)?;
+        println!("Captured baseline snapshot. Waiting {interval_ms} ms...");
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+        let after = self.pal.read_raw(addr, size)?;
+
+        let diffs = compute_struct_diff(addr, &before, &after);
+        if diffs.is_empty() {
+            println!("No changes detected during {interval_ms} ms interval.");
+        } else {
+            println!("Detected {} change(s) in structure:", diffs.len());
+            println!("{:<10} | {:<20} -> {:<20} | Summary", "Offset", "Old Bytes", "New Bytes");
+            println!("{:-<10}-+-{:-<20}-+-{:-<20}-+-{:-<30}", "", "", "", "");
+            for d in &diffs {
+                println!("{:<10} | {:<20} -> {:<20} | {}", d.offset_hex, d.old_bytes_hex, d.new_bytes_hex, d.summary);
+            }
+        }
+        Ok(())
+    }
+
+    fn cmd_batch(&mut self, items: &[&str]) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let modules = self.pal.enumerate_modules().unwrap_or_default();
+        let arch = self.pal.architecture();
+
+        println!("Executing batch read of {} item(s):", items.len());
+        for (idx, &item) in items.iter().enumerate() {
+            let (expr, type_str) = if let Some((e, t)) = item.split_once(':') {
+                (e.trim(), t.trim())
+            } else {
+                (item.trim(), "i32")
+            };
+
+            let resolved_addr: Result<Address, anyhow::Error> = if expr.contains("->") {
+                let parts: Vec<&str> = expr.split("->").map(|s| s.trim()).collect();
+                let base_part = parts[0];
+                let mut current_addr = if let Some((mod_name, off_str)) = base_part.split_once('+') {
+                    let base_off = parse_hex_or_dec(off_str)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))?;
+                    let m = modules.iter().find(|m| m.name.eq_ignore_ascii_case(mod_name.trim()) || m.name.to_lowercase().contains(&mod_name.to_lowercase()))
+                        .ok_or_else(|| anyhow::anyhow!("Module '{mod_name}' not found"))?;
+                    m.base_address.add(base_off as usize)
+                } else {
+                    let a = parse_hex_or_dec(base_part)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid base address '{base_part}'"))?;
+                    Address::new(a)
+                };
+
+                current_addr = self.pal.read_pointer(current_addr, arch)?;
+                for (level, &off_str) in parts[1..].iter().enumerate() {
+                    let off = if let Some(s) = off_str.strip_prefix('+') {
+                        parse_hex_or_dec(s).ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))? as i64
+                    } else if let Some(s) = off_str.strip_prefix('-') {
+                        -(parse_hex_or_dec(s).ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))? as i64)
+                    } else {
+                        parse_hex_or_dec(off_str).ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))? as i64
+                    };
+                    let next = current_addr.offset(off);
+                    if level == parts.len() - 2 {
+                        current_addr = next;
+                    } else {
+                        current_addr = self.pal.read_pointer(next, arch)?;
+                    }
+                }
+                Ok(current_addr)
+            } else if let Some((mod_name, off_str)) = expr.split_once('+') {
+                let base_off = parse_hex_or_dec(off_str)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid offset '{off_str}'"))?;
+                let m = modules.iter().find(|m| m.name.eq_ignore_ascii_case(mod_name.trim()) || m.name.to_lowercase().contains(&mod_name.to_lowercase()))
+                    .ok_or_else(|| anyhow::anyhow!("Module '{mod_name}' not found"))?;
+                Ok(m.base_address.add(base_off as usize))
+            } else {
+                let a = parse_hex_or_dec(expr)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid address '{expr}'"))?;
+                Ok(Address::new(a))
+            };
+
+            match resolved_addr {
+                Ok(addr) => {
+                    let val_str = match type_str.to_lowercase().as_str() {
+                        "i8" => self.pal.read_i8(addr).map(|v| format!("{v}")),
+                        "u8" => self.pal.read_u8(addr).map(|v| format!("{v} (0x{v:02X})")),
+                        "i16" => self.pal.read_i16(addr).map(|v| format!("{v}")),
+                        "u16" => self.pal.read_u16(addr).map(|v| format!("{v} (0x{v:04X})")),
+                        "i32" => self.pal.read_i32(addr).map(|v| format!("{v}")),
+                        "u32" => self.pal.read_u32(addr).map(|v| format!("{v} (0x{v:08X})")),
+                        "i64" => self.pal.read_i64(addr).map(|v| format!("{v}")),
+                        "u64" => self.pal.read_u64(addr).map(|v| format!("{v} (0x{v:016X})")),
+                        "f32" => self.pal.read_f32(addr).map(|v| format!("{v:.4}")),
+                        "f64" => self.pal.read_f64(addr).map(|v| format!("{v:.6}")),
+                        "hex" => self.pal.read_raw(addr, 16).map(|b| b.iter().map(|x| format!("{x:02X}")).collect::<Vec<_>>().join(" ")),
+                        _ => self.pal.read_i32(addr).map(|v| format!("{v}")),
+                    };
+                    match val_str {
+                        Ok(v) => println!("  [#{}] {} => {} [{}] = {}", idx + 1, expr, addr, type_str, v),
+                        Err(e) => println!("  [#{}] {} => {} [{}] = Error: {}", idx + 1, expr, addr, type_str, e),
+                    }
+                }
+                Err(e) => println!("  [#{}] {} => Error: {}", idx + 1, expr, e),
+            }
+        }
         Ok(())
     }
 }
