@@ -191,6 +191,91 @@ mod tests {
         assert!(tools.iter().any(|t| t["name"] == "struct_reconstruct"));
         assert!(tools.iter().any(|t| t["name"] == "struct_export"));
         assert!(tools.iter().any(|t| t["name"] == "struct_rename_field"));
+        assert!(tools.iter().any(|t| t["name"] == "debug_breakpoint_set"));
+        assert!(tools.iter().any(|t| t["name"] == "debug_breakpoint_remove"));
+        assert!(tools.iter().any(|t| t["name"] == "debug_breakpoint_list"));
+        assert!(tools.iter().any(|t| t["name"] == "debug_find_what_writes"));
+        assert!(tools.iter().any(|t| t["name"] == "debug_get_registers"));
+        assert!(tools.iter().any(|t| t["name"] == "debug_pause"));
+        assert!(tools.iter().any(|t| t["name"] == "debug_resume"));
+        assert!(tools.iter().any(|t| t["name"] == "debug_step"));
+    }
+
+    #[test]
+    fn test_mcp_tool_call_debug_breakpoints_and_what_writes() {
+        let server = McpServer::new();
+
+        // 1. Set a hardware write breakpoint
+        let set_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(10)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "debug_breakpoint_set",
+                "arguments": {
+                    "address": "0x7FFF1000",
+                    "bp_type": "hardware_write",
+                    "size": 4
+                }
+            })),
+        };
+        let set_resp = server.handle_request(set_req).expect("should succeed");
+        let set_res = set_resp.result.expect("result");
+        assert_eq!(set_res["isError"], false);
+        let set_text = set_res["content"][0]["text"].as_str().unwrap();
+        assert!(set_text.contains("DR0"));
+
+        // 2. List breakpoints
+        let list_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(11)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "debug_breakpoint_list",
+                "arguments": {}
+            })),
+        };
+        let list_resp = server.handle_request(list_req).expect("should succeed");
+        let list_res = list_resp.result.expect("result");
+        assert_eq!(list_res["isError"], false);
+        let list_text = list_res["content"][0]["text"].as_str().unwrap();
+        assert!(list_text.contains("Hardware DR0"));
+
+        // 3. Remove breakpoint
+        let rem_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(12)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "debug_breakpoint_remove",
+                "arguments": {
+                    "id": 1000
+                }
+            })),
+        };
+        let rem_resp = server.handle_request(rem_req).expect("should succeed");
+        let rem_res = rem_resp.result.expect("result");
+        assert_eq!(rem_res["isError"], false);
+
+        // 4. Test find_what_writes
+        let ww_req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(13)),
+            method: "tools/call".to_string(),
+            params: Some(json!({
+                "name": "debug_find_what_writes",
+                "arguments": {
+                    "address": "0x7FFF123450",
+                    "size": 4
+                }
+            })),
+        };
+        let ww_resp = server.handle_request(ww_req).expect("should succeed");
+        let ww_res = ww_resp.result.expect("result");
+        assert_eq!(ww_res["isError"], false);
+        let ww_text = ww_res["content"][0]["text"].as_str().unwrap();
+        assert!(ww_text.contains("target_address"));
+        assert!(ww_text.contains("table_view"));
     }
 
     #[test]

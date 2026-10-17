@@ -1,6 +1,10 @@
-use engine_core::{FirstScanMode, MemoryScanner, NextScanMode, ScanConfig, ScanValue, ScanValueType};
+use engine_core::{
+    BreakpointManager, FirstScanMode, HitTracer, MemoryScanner, NextScanMode, ScanConfig,
+    ScanValue, ScanValueType,
+};
 use engine_pal::{
-    default_backend, default_enumerator, Address, ProcessAccessLayer, ProcessId, ProtectionFlags,
+    default_backend, default_enumerator, Address, BreakpointId, ProcessAccessLayer, ProcessId,
+    ProtectionFlags, WatchpointCondition, WatchpointSize,
 };
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 use std::io::{self, BufRead, Write};
@@ -9,6 +13,8 @@ use std::io::{self, BufRead, Write};
 pub struct InteractiveConsole {
     pal: Box<dyn ProcessAccessLayer>,
     scanner: MemoryScanner,
+    debugger: BreakpointManager,
+    tracers: std::collections::HashMap<Address, HitTracer>,
     attached_pid: Option<ProcessId>,
     attached_name: Option<String>,
     current_scan_type: ScanValueType,
@@ -20,6 +26,8 @@ impl InteractiveConsole {
         InteractiveConsole {
             pal: default_backend(),
             scanner: MemoryScanner::new(),
+            debugger: BreakpointManager::new(),
+            tracers: std::collections::HashMap::new(),
             attached_pid: None,
             attached_name: None,
             current_scan_type: ScanValueType::I32,
@@ -273,6 +281,54 @@ impl InteractiveConsole {
                         self.cmd_aa(&script, enable)?;
                     }
                 }
+                "bp" => {
+                    if args.is_empty() {
+                        println!("Usage: bp <hex_address> [software|write|access|execute] [size]");
+                        println!("  Example: bp 0x7FFF1000");
+                        println!("  Example: bp 0x7FFF123450 write 4");
+                    } else {
+                        let addr_str = args[0];
+                        let bp_type = args.get(1).copied().unwrap_or("software");
+                        let size = args.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
+                        self.cmd_bp(addr_str, bp_type, size)?;
+                    }
+                }
+                "rbp" => {
+                    if args.is_empty() {
+                        println!("Usage: rbp <id_or_slot>");
+                    } else if let Ok(id) = args[0].parse::<u64>() {
+                        self.cmd_rbp(id)?;
+                    } else {
+                        println!("Error: Invalid breakpoint ID '{}'", args[0]);
+                    }
+                }
+                "bplist" => {
+                    self.cmd_bplist()?;
+                }
+                "whatwrites" | "ww" => {
+                    if args.is_empty() {
+                        println!("Usage: whatwrites <hex_address> [size]");
+                        println!("  Example: whatwrites 0x7FFF123450 4");
+                    } else {
+                        let addr_str = args[0];
+                        let size = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
+                        self.cmd_whatwrites(addr_str, size)?;
+                    }
+                }
+                "regs" => {
+                    let tid = args.first().and_then(|s| s.parse::<ProcessId>().ok());
+                    self.cmd_regs(tid)?;
+                }
+                "pause" => {
+                    self.cmd_pause()?;
+                }
+                "resume" => {
+                    self.cmd_resume()?;
+                }
+                "step" => {
+                    let tid = args.first().and_then(|s| s.parse::<ProcessId>().ok());
+                    self.cmd_step(tid)?;
+                }
                 _ => {
                     println!("Unknown command: '{cmd}'. Type 'help' for available commands.");
                 }
@@ -306,6 +362,14 @@ impl InteractiveConsole {
         println!("  free <addr>                 - Free allocated memory in target process");
         println!("  aa <script|file> [disable]  - Cheat Engine style AutoAssembler script ([ENABLE]/[DISABLE], alloc, labels)");
         println!("  lua <code>                  - Execute script in sandboxed Lua 5.4 environment");
+        println!("  bp <addr> [type] [size]     - Set breakpoint (software, write, access, execute)");
+        println!("  rbp <id>                    - Remove software/hardware breakpoint by ID");
+        println!("  bplist                      - List all active software and hardware breakpoints");
+        println!("  whatwrites <addr> [size]    - Cheat Engine 'What writes to this address?' tracer");
+        println!("  regs [tid]                  - Snapshot & dump CPU registers (RAX, RBX, RIP, EFLAGS)");
+        println!("  pause                       - Pause/freeze target process execution (SIGSTOP)");
+        println!("  resume                      - Resume target process execution (SIGCONT)");
+        println!("  step [tid]                  - Advance single instruction (Single Step)");
         println!("  exit / quit                 - Quit interactive console\n");
     }
 
@@ -879,6 +943,146 @@ impl InteractiveConsole {
         };
 
         println!("{code}");
+        Ok(())
+    }
+
+    fn cmd_bp(&mut self, addr_str: &str, bp_type: &str, size: usize) -> anyhow::Result<()> {
+        let addr_val = parse_hex_or_dec(addr_str)
+            .ok_or_else(|| anyhow::anyhow!("Invalid address '{addr_str}'"))?;
+        let addr = Address::new(addr_val);
+
+        match bp_type.to_lowercase().as_str() {
+            "software" | "sw" | "int3" => {
+                if !self.pal.is_attached() {
+                    anyhow::bail!("Attach to a process first ('attach <pid>')");
+                }
+                let id = self.debugger.set_software_breakpoint(&mut *self.pal, addr)?;
+                println!("Software breakpoint #{} installed at {addr} (INT3 0xCC written)", id.0);
+            }
+            "write" | "hw_write" => {
+                let slot = self.debugger.set_hardware_breakpoint(addr, WatchpointCondition::Write, WatchpointSize::from_bytes(size))?;
+                println!("Hardware watchpoint installed in DR{slot} at {addr} (Write, {size} bytes)");
+            }
+            "access" | "hw_access" | "rw" => {
+                let slot = self.debugger.set_hardware_breakpoint(addr, WatchpointCondition::Access, WatchpointSize::from_bytes(size))?;
+                println!("Hardware watchpoint installed in DR{slot} at {addr} (Read/Write, {size} bytes)");
+            }
+            "execute" | "exec" | "hw_exec" => {
+                let slot = self.debugger.set_hardware_breakpoint(addr, WatchpointCondition::Execution, WatchpointSize::from_bytes(size))?;
+                println!("Hardware execution breakpoint installed in DR{slot} at {addr}");
+            }
+            other => anyhow::bail!("Unknown breakpoint type: '{other}' (expected 'software', 'write', 'access', 'execute')"),
+        }
+        Ok(())
+    }
+
+    fn cmd_rbp(&mut self, id: u64) -> anyhow::Result<()> {
+        if (1000..=1003).contains(&id) {
+            let slot = (id - 1000) as usize;
+            self.debugger.remove_hardware_breakpoint(slot)?;
+            println!("Hardware breakpoint in DR{slot} removed");
+        } else if id <= 3 && self.debugger.list_breakpoints().iter().any(|b| b.id == 1000 + id) {
+            self.debugger.remove_hardware_breakpoint(id as usize)?;
+            println!("Hardware breakpoint in DR{id} removed");
+        } else {
+            if !self.pal.is_attached() {
+                anyhow::bail!("Attach to a process first ('attach <pid>')");
+            }
+            self.debugger.remove_software_breakpoint(&mut *self.pal, BreakpointId(id))?;
+            println!("Software breakpoint #{id} removed and original byte restored");
+        }
+        Ok(())
+    }
+
+    fn cmd_bplist(&self) -> anyhow::Result<()> {
+        let list = self.debugger.list_breakpoints();
+        if list.is_empty() {
+            println!("No active breakpoints registered.");
+            return Ok(());
+        }
+
+        println!("{:<6} {:<18} {:<30} STATUS", "ID", "ADDRESS", "KIND");
+        println!("{:-<70}", "");
+        for bp in list {
+            let status = if bp.enabled { "Enabled" } else { "Disabled" };
+            println!("{:<6} {:<18} {:<30} {}", bp.id, bp.address, bp.kind, status);
+        }
+        Ok(())
+    }
+
+    fn cmd_whatwrites(&mut self, addr_str: &str, size: usize) -> anyhow::Result<()> {
+        let addr_val = parse_hex_or_dec(addr_str)
+            .ok_or_else(|| anyhow::anyhow!("Invalid address '{addr_str}'"))?;
+        let target_addr = Address::new(addr_val);
+
+        let tracer = self.tracers.entry(target_addr).or_insert_with(|| {
+            HitTracer::new(target_addr, size, WatchpointCondition::Write)
+        });
+
+        // Scan executable memory for xrefs referencing this address
+        if self.pal.is_attached() {
+            if let Ok(regions) = self.pal.query_regions() {
+                let rx_regions: Vec<_> = regions.into_iter().filter(|r| r.is_executable() && r.is_readable()).collect();
+                for r in rx_regions.iter().take(5) {
+                    let scan_size = r.size.min(0x40000);
+                    if let Ok(bytes) = self.pal.read_raw(r.start, scan_size) {
+                        let bitness = match self.pal.architecture() {
+                            engine_pal::CpuArchitecture::X86_32 => 32,
+                            engine_pal::CpuArchitecture::X86_64 => 64,
+                        };
+                        let xrefs = engine_core::find_xrefs_in_code(&bytes, r.start.as_u64(), bitness, target_addr.as_u64());
+                        for xref in xrefs {
+                            let regs = engine_pal::CpuRegisters {
+                                rip: xref.instruction_address.as_u64(),
+                                ..Default::default()
+                            };
+                            tracer.record_hit(xref.instruction_address, regs, Some(xref.instruction_text), None);
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("{}", tracer.format_table());
+        Ok(())
+    }
+
+    fn cmd_regs(&self, tid: Option<ProcessId>) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let regs = self.pal.get_registers(tid)?;
+        println!("{}", regs.format_display());
+        Ok(())
+    }
+
+    fn cmd_pause(&mut self) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        self.pal.suspend_process()?;
+        let pid = self.pal.attached_pid().unwrap_or(0);
+        println!("Process {pid} execution paused (frozen)");
+        Ok(())
+    }
+
+    fn cmd_resume(&mut self) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        self.pal.resume_process()?;
+        let pid = self.pal.attached_pid().unwrap_or(0);
+        println!("Process {pid} execution resumed");
+        Ok(())
+    }
+
+    fn cmd_step(&mut self, tid: Option<ProcessId>) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let regs = self.pal.single_step(tid)?;
+        println!("Stepped to RIP: 0x{:016X}", regs.rip);
+        println!("{}", regs.format_display());
         Ok(())
     }
 }

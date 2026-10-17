@@ -15,6 +15,9 @@ pub enum CoreError {
     #[error("Disassembly error: {0}")]
     Disassembly(String),
 
+    #[error("Debugger error: {0}")]
+    Debugger(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

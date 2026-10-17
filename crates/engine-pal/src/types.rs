@@ -221,6 +221,160 @@ pub struct ProcessEntry {
     pub architecture: CpuArchitecture,
 }
 
+/// Target CPU Registers snapshot (x86_64 / x86_32)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CpuRegisters {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub rsp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub rflags: u64,
+}
+
+impl CpuRegisters {
+    #[inline]
+    pub fn cf(&self) -> bool {
+        (self.rflags & 0x0001) != 0
+    }
+
+    #[inline]
+    pub fn pf(&self) -> bool {
+        (self.rflags & 0x0004) != 0
+    }
+
+    #[inline]
+    pub fn af(&self) -> bool {
+        (self.rflags & 0x0010) != 0
+    }
+
+    #[inline]
+    pub fn zf(&self) -> bool {
+        (self.rflags & 0x0040) != 0
+    }
+
+    #[inline]
+    pub fn sf(&self) -> bool {
+        (self.rflags & 0x0080) != 0
+    }
+
+    #[inline]
+    pub fn tf(&self) -> bool {
+        (self.rflags & 0x0100) != 0
+    }
+
+    #[inline]
+    pub fn if_flag(&self) -> bool {
+        (self.rflags & 0x0200) != 0
+    }
+
+    #[inline]
+    pub fn df(&self) -> bool {
+        (self.rflags & 0x0400) != 0
+    }
+
+    #[inline]
+    pub fn of(&self) -> bool {
+        (self.rflags & 0x0800) != 0
+    }
+
+    pub fn format_display(&self) -> String {
+        format!(
+            "RAX: 0x{:016X}  RBX: 0x{:016X}  RCX: 0x{:016X}  RDX: 0x{:016X}\n\
+             RSI: 0x{:016X}  RDI: 0x{:016X}  RBP: 0x{:016X}  RSP: 0x{:016X}\n\
+             R8:  0x{:016X}  R9:  0x{:016X}  R10: 0x{:016X}  R11: 0x{:016X}\n\
+             R12: 0x{:016X}  R13: 0x{:016X}  R14: 0x{:016X}  R15: 0x{:016X}\n\
+             RIP: 0x{:016X}  RFLAGS: 0x{:08X} [CF:{} ZF:{} SF:{} OF:{}]",
+            self.rax, self.rbx, self.rcx, self.rdx,
+            self.rsi, self.rdi, self.rbp, self.rsp,
+            self.r8, self.r9, self.r10, self.r11,
+            self.r12, self.r13, self.r14, self.r15,
+            self.rip, self.rflags as u32,
+            self.cf() as u8, self.zf() as u8, self.sf() as u8, self.of() as u8
+        )
+    }
+}
+
+/// Hardware watchpoint trigger condition
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WatchpointCondition {
+    Execution,
+    Write,
+    Access,
+}
+
+/// Hardware watchpoint monitored size (in bytes)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WatchpointSize {
+    Bytes1 = 1,
+    Bytes2 = 2,
+    Bytes4 = 4,
+    Bytes8 = 8,
+}
+
+impl WatchpointSize {
+    pub fn from_bytes(bytes: usize) -> Self {
+        match bytes {
+            2 => WatchpointSize::Bytes2,
+            4 => WatchpointSize::Bytes4,
+            8 => WatchpointSize::Bytes8,
+            _ => WatchpointSize::Bytes1,
+        }
+    }
+
+    pub fn byte_count(&self) -> usize {
+        *self as usize
+    }
+}
+
+/// Hardware breakpoint slot (DR0-DR3)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HardwareBreakpointSlot {
+    Dr0 = 0,
+    Dr1 = 1,
+    Dr2 = 2,
+    Dr3 = 3,
+}
+
+impl HardwareBreakpointSlot {
+    pub fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(HardwareBreakpointSlot::Dr0),
+            1 => Some(HardwareBreakpointSlot::Dr1),
+            2 => Some(HardwareBreakpointSlot::Dr2),
+            3 => Some(HardwareBreakpointSlot::Dr3),
+            _ => None,
+        }
+    }
+
+    pub fn index(&self) -> usize {
+        *self as usize
+    }
+}
+
+/// Debug register hit record (e.g. from \"What writes to this address?\")
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugHit {
+    pub address: Address,
+    pub instruction_pointer: Address,
+    pub thread_id: Option<u32>,
+    pub hit_count: u64,
+    pub registers: CpuRegisters,
+    pub disassembly: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +414,29 @@ mod tests {
     fn test_architecture_pointer_size() {
         assert_eq!(CpuArchitecture::X86_32.pointer_size(), 4);
         assert_eq!(CpuArchitecture::X86_64.pointer_size(), 8);
+    }
+
+    #[test]
+    fn test_cpu_registers_and_watchpoints() {
+        let mut regs = CpuRegisters::default();
+        regs.rax = 0x1234;
+        regs.rip = 0x7FFF0000;
+        // Set ZF (bit 6) and CF (bit 0)
+        regs.rflags = 0x0041;
+        assert!(regs.zf());
+        assert!(regs.cf());
+        assert!(!regs.sf());
+        assert!(!regs.of());
+
+        let display = regs.format_display();
+        assert!(display.contains("RAX: 0x0000000000001234"));
+        assert!(display.contains("ZF:1"));
+
+        assert_eq!(WatchpointSize::from_bytes(4), WatchpointSize::Bytes4);
+        assert_eq!(WatchpointSize::Bytes4.byte_count(), 4);
+
+        assert_eq!(HardwareBreakpointSlot::from_index(2), Some(HardwareBreakpointSlot::Dr2));
+        assert_eq!(HardwareBreakpointSlot::Dr2.index(), 2);
     }
 }
 

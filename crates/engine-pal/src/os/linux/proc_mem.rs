@@ -165,6 +165,18 @@ impl ProcessAccessLayer for ProcMemBackend {
         })
     }
 
+    fn suspend_process(&mut self) -> PalResult<()> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGSTOP)
+            .map_err(|e| PalError::Io(std::io::Error::from_raw_os_error(e as i32)))
+    }
+
+    fn resume_process(&mut self) -> PalResult<()> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGCONT)
+            .map_err(|e| PalError::Io(std::io::Error::from_raw_os_error(e as i32)))
+    }
+
     fn allocate_memory(&self, _size: usize, _protection: ProtectionFlags) -> PalResult<Address> {
         Err(PalError::NotSupported {
             backend: self.backend_name(),

@@ -1,6 +1,6 @@
 use crate::error::PalResult;
 use crate::types::{
-    Address, BreakpointId, BreakpointType, CpuArchitecture, MemoryRegion, ModuleInfo,
+    Address, BreakpointId, BreakpointType, CpuArchitecture, CpuRegisters, MemoryRegion, ModuleInfo,
     ProcessEntry, ProcessId, ProtectionFlags, StealthLevel, ThreadInfo,
 };
 use byteorder::{ByteOrder, LittleEndian};
@@ -46,6 +46,46 @@ pub trait ProcessAccessLayer: Send + Sync {
 
     /// Remove a previously set breakpoint
     fn remove_breakpoint(&mut self, id: BreakpointId) -> PalResult<()>;
+
+    /// Suspend execution of the target process
+    fn suspend_process(&mut self) -> PalResult<()> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "suspend_process not implemented".to_string(),
+        })
+    }
+
+    /// Resume execution of the target process
+    fn resume_process(&mut self) -> PalResult<()> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "resume_process not implemented".to_string(),
+        })
+    }
+
+    /// Read CPU register state from target process or specific thread
+    fn get_registers(&self, _thread_id: Option<ProcessId>) -> PalResult<CpuRegisters> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "get_registers not implemented".to_string(),
+        })
+    }
+
+    /// Write CPU register state to target process or specific thread
+    fn set_registers(&mut self, _thread_id: Option<ProcessId>, _regs: &CpuRegisters) -> PalResult<()> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "set_registers not implemented".to_string(),
+        })
+    }
+
+    /// Advance target process or thread by a single instruction (Single Step)
+    fn single_step(&mut self, _thread_id: Option<ProcessId>) -> PalResult<CpuRegisters> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "single_step not implemented".to_string(),
+        })
+    }
 
     /// Allocate virtual memory in target process
     fn allocate_memory(&self, size: usize, protection: ProtectionFlags) -> PalResult<Address>;

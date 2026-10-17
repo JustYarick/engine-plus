@@ -281,6 +281,44 @@ enum Commands {
         #[arg(short, long, default_value = "ReconstructedClass")]
         name: String,
     },
+
+    /// Pause target process execution (freeze threads/SIGSTOP)
+    Pause {
+        #[arg(short, long)]
+        pid: ProcessId,
+    },
+
+    /// Resume target process execution
+    Resume {
+        #[arg(short, long)]
+        pid: ProcessId,
+    },
+
+    /// Read and dump CPU registers snapshot from target process
+    Regs {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        #[arg(short, long)]
+        thread_id: Option<ProcessId>,
+    },
+
+    /// Set a software or hardware breakpoint/watchpoint on target address
+    Bp {
+        #[arg(short, long)]
+        pid: ProcessId,
+
+        #[arg(short, long)]
+        address: String,
+
+        /// Breakpoint type: software, write, access, execute
+        #[arg(short = 't', long, default_value = "software")]
+        bp_type: String,
+
+        /// Watchpoint monitored size (1, 2, 4, 8 bytes)
+        #[arg(short, long, default_value = "4")]
+        size: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -788,6 +826,63 @@ async fn main() -> anyhow::Result<()> {
                 println!();
             }
         }
+        Some(Commands::Pause { pid }) => {
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            pal.suspend_process()?;
+            println!("Process {pid} execution paused (frozen)");
+        }
+        Some(Commands::Resume { pid }) => {
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            pal.resume_process()?;
+            println!("Process {pid} execution resumed");
+        }
+        Some(Commands::Regs { pid, thread_id }) => {
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let regs = pal.get_registers(thread_id)?;
+            println!("{}", regs.format_display());
+        }
+        Some(Commands::Bp { pid, address, bp_type, size }) => {
+            let addr = parse_hex_or_dec_val(&address)
+                .ok_or_else(|| anyhow::anyhow!("Invalid address '{address}'"))?;
+            let mut pal = default_backend();
+            pal.attach(pid)?;
+            let mut bpm = engine_core::BreakpointManager::new();
+
+            match bp_type.to_lowercase().as_str() {
+                "software" | "sw" | "int3" => {
+                    let id = bpm.set_software_breakpoint(&mut *pal, Address::new(addr))?;
+                    println!("Software breakpoint #{} set at 0x{:X} (INT3 0xCC written)", id.0, addr);
+                }
+                "write" | "hw_write" => {
+                    let slot = bpm.set_hardware_breakpoint(
+                        Address::new(addr),
+                        engine_pal::WatchpointCondition::Write,
+                        engine_pal::WatchpointSize::from_bytes(size),
+                    )?;
+                    println!("Hardware watchpoint set in DR{slot} at 0x{:X} (Write, {} bytes)", addr, size);
+                }
+                "access" | "hw_access" | "rw" => {
+                    let slot = bpm.set_hardware_breakpoint(
+                        Address::new(addr),
+                        engine_pal::WatchpointCondition::Access,
+                        engine_pal::WatchpointSize::from_bytes(size),
+                    )?;
+                    println!("Hardware watchpoint set in DR{slot} at 0x{:X} (Read/Write, {} bytes)", addr, size);
+                }
+                "execute" | "exec" | "hw_exec" => {
+                    let slot = bpm.set_hardware_breakpoint(
+                        Address::new(addr),
+                        engine_pal::WatchpointCondition::Execution,
+                        engine_pal::WatchpointSize::from_bytes(size),
+                    )?;
+                    println!("Hardware execution breakpoint set in DR{slot} at 0x{:X}", addr);
+                }
+                other => anyhow::bail!("Unknown breakpoint type: '{other}'"),
+            }
+        }
     }
 
     Ok(())
@@ -831,6 +926,10 @@ mod tests {
         assert!(Cli::try_parse_from(["engine-plus", "script", "-c", "return 1"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "aa", "-p", "1234", "-s", "[ENABLE]"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "assemble", "-c", "xor eax, eax"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "pause", "-p", "1234"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "resume", "-p", "1234"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "regs", "-p", "1234"]).is_ok());
+        assert!(Cli::try_parse_from(["engine-plus", "bp", "-p", "1234", "-a", "0x7FFF1000"]).is_ok());
         assert!(Cli::try_parse_from(["engine-plus", "--mcp"]).is_ok());
     }
 

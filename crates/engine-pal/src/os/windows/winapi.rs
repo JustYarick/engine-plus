@@ -10,7 +10,8 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
-    TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
+    TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPTHREAD, Thread32First, Thread32Next,
+    THREADENTRY32,
 };
 use windows_sys::Win32::System::Memory::{
     VirtualAllocEx, VirtualFreeEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
@@ -18,8 +19,9 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_WRITECOPY, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-    PROCESS_VM_READ, PROCESS_VM_WRITE,
+    OpenProcess, OpenThread, ResumeThread, SuspendThread, PROCESS_ALL_ACCESS,
+    PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    THREAD_SUSPEND_RESUME,
 };
 
 /// RAII wrapper for Win32 HANDLE
@@ -268,7 +270,84 @@ impl ProcessAccessLayer for WinApiBackend {
     }
 
     fn enumerate_threads(&self) -> PalResult<Vec<ThreadInfo>> {
-        Ok(Vec::new())
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        let mut threads = Vec::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap != INVALID_HANDLE_VALUE {
+                let _snap_guard = AutoHandle::new(snap);
+                let mut entry: THREADENTRY32 = zeroed();
+                entry.dwSize = size_of::<THREADENTRY32>() as u32;
+                if Thread32First(snap, &mut entry) != 0 {
+                    loop {
+                        if entry.th32OwnerProcessID == pid {
+                            threads.push(ThreadInfo {
+                                id: entry.th32ThreadID,
+                                state: None,
+                            });
+                        }
+                        if Thread32Next(snap, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(threads)
+    }
+
+    fn suspend_process(&mut self) -> PalResult<()> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return Err(PalError::Io(std::io::Error::last_os_error()));
+            }
+            let _snap_guard = AutoHandle::new(snap);
+            let mut entry: THREADENTRY32 = zeroed();
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            if Thread32First(snap, &mut entry) != 0 {
+                loop {
+                    if entry.th32OwnerProcessID == pid {
+                        let h_thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                        if let Some(_th_guard) = AutoHandle::new(h_thread) {
+                            SuspendThread(h_thread);
+                        }
+                    }
+                    if Thread32Next(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resume_process(&mut self) -> PalResult<()> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return Err(PalError::Io(std::io::Error::last_os_error()));
+            }
+            let _snap_guard = AutoHandle::new(snap);
+            let mut entry: THREADENTRY32 = zeroed();
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            if Thread32First(snap, &mut entry) != 0 {
+                loop {
+                    if entry.th32OwnerProcessID == pid {
+                        let h_thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                        if let Some(_th_guard) = AutoHandle::new(h_thread) {
+                            ResumeThread(h_thread);
+                        }
+                    }
+                    if Thread32Next(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn set_breakpoint(

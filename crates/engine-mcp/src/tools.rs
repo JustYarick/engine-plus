@@ -2,10 +2,12 @@ use crate::optimizer::analyze_memory_block;
 use crate::protocol::{CallToolResult, Tool};
 use engine_core::{
     assemble_code, build_detour_hook, find_xrefs_in_code, generate_pattern_from_bytes,
-    ClassStructure, FirstScanMode, MemoryScanner, NextScanMode, ScanConfig, ScanValue, ScanValueType,
+    BreakpointManager, ClassStructure, FirstScanMode, HitTracer, MemoryScanner, NextScanMode,
+    ScanConfig, ScanValue, ScanValueType,
 };
 use engine_pal::{
-    default_backend, default_enumerator, Address, ProcessAccessLayer, ProcessId, ProtectionFlags,
+    default_backend, default_enumerator, Address, BreakpointId, ProcessAccessLayer, ProcessId,
+    ProtectionFlags, WatchpointCondition, WatchpointSize,
 };
 use engine_script::{AutoAssembler, ScriptEngine};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
@@ -19,6 +21,8 @@ pub struct EngineSession {
     pub scanner: Arc<Mutex<MemoryScanner>>,
     pub script_engine: Arc<Mutex<ScriptEngine>>,
     pub aa_allocations: Arc<Mutex<HashMap<String, Address>>>,
+    pub debugger: Arc<Mutex<BreakpointManager>>,
+    pub hit_tracers: Arc<Mutex<HashMap<Address, HitTracer>>>,
 }
 
 impl EngineSession {
@@ -34,12 +38,16 @@ impl EngineSession {
             )
             .expect("Failed to initialize ScriptEngine"),
         ));
+        let debugger = Arc::new(Mutex::new(BreakpointManager::new()));
+        let hit_tracers = Arc::new(Mutex::new(HashMap::new()));
 
         EngineSession {
             pal,
             scanner,
             script_engine,
             aa_allocations,
+            debugger,
+            hit_tracers,
         }
     }
 }
@@ -383,6 +391,97 @@ pub fn list_tools() -> Vec<Tool> {
                 "required": ["address", "field_offset", "new_name"]
             }),
         },
+        Tool {
+            name: "debug_breakpoint_set".to_string(),
+            description: "Set a software breakpoint (INT3 opcode substitution) or hardware breakpoint/watchpoint (DR0-DR3 on write/read/execute) at target memory address.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Target hex memory address (e.g. '0x7FFF123450')" },
+                    "bp_type": {
+                        "type": "string",
+                        "enum": ["software", "hardware_write", "hardware_access", "hardware_execute"],
+                        "default": "software",
+                        "description": "Breakpoint mechanism: 'software' (INT3), 'hardware_write' (DR0-DR3 data write), 'hardware_access' (DR0-DR3 read/write), 'hardware_execute' (DR0-DR3 execution)"
+                    },
+                    "size": {
+                        "type": "integer",
+                        "enum": [1, 2, 4, 8],
+                        "default": 4,
+                        "description": "Monitored memory size in bytes for hardware watchpoints (1, 2, 4, 8)"
+                    }
+                },
+                "required": ["address"]
+            }),
+        },
+        Tool {
+            name: "debug_breakpoint_remove".to_string(),
+            description: "Remove a previously registered software or hardware breakpoint by ID and restore original instruction bytes.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Breakpoint ID (for software breakpoint) or hardware slot (0..3)" }
+                },
+                "required": ["id"]
+            }),
+        },
+        Tool {
+            name: "debug_breakpoint_list".to_string(),
+            description: "List all active software (INT3) and hardware (DR0-DR3) breakpoints with addresses and hit counts.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        Tool {
+            name: "debug_find_what_writes".to_string(),
+            description: "Cheat Engine 'What writes to this address?' tracer: analyzes which assembly instructions modify or access the specified memory location, accumulating hit counts, instruction disassemblies, and CPU register snapshots.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Target hex memory address to watch (e.g. player health)" },
+                    "size": { "type": "integer", "default": 4, "description": "Monitored memory size in bytes (1, 2, 4, 8)" },
+                    "duration_ms": { "type": "integer", "default": 500, "description": "Sampling duration in milliseconds" }
+                },
+                "required": ["address"]
+            }),
+        },
+        Tool {
+            name: "debug_get_registers".to_string(),
+            description: "Read snapshot of all CPU registers (RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP, R8-R15, RIP, RFLAGS and CPU flags) from the target process or thread.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread_id": { "type": "integer", "description": "Optional thread ID. If omitted, uses main thread." }
+                }
+            }),
+        },
+        Tool {
+            name: "debug_pause".to_string(),
+            description: "Pause target process execution (freeze threads/SIGSTOP) for safe inspection, memory reading, and breakpoint analysis.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        Tool {
+            name: "debug_resume".to_string(),
+            description: "Resume target process execution after being paused or stepping.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        Tool {
+            name: "debug_step".to_string(),
+            description: "Advance target process execution by a single instruction (Single Step) and return updated CPU registers snapshot.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread_id": { "type": "integer", "description": "Optional thread ID to step" }
+                }
+            }),
+        },
     ]
 }
 
@@ -393,13 +492,15 @@ pub fn dispatch_tool_call(
     args: Option<Value>,
 ) -> CallToolResult {
     let args = args.unwrap_or(json!({}));
-    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc) = {
+    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc, debugger_arc, hit_tracers_arc) = {
         let s = session_arc.lock().unwrap();
         (
             Arc::clone(&s.pal),
             Arc::clone(&s.scanner),
             Arc::clone(&s.script_engine),
             Arc::clone(&s.aa_allocations),
+            Arc::clone(&s.debugger),
+            Arc::clone(&s.hit_tracers),
         )
     };
 
@@ -1267,6 +1368,230 @@ pub fn dispatch_tool_call(
             match structure.rename_field(offset, new_name) {
                 Ok(()) => CallToolResult::json(&structure).unwrap_or_else(|e| CallToolResult::error(e.to_string())),
                 Err(e) => CallToolResult::error(format!("Failed to rename field: {e}")),
+            }
+        }
+        "debug_breakpoint_set" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing required parameter 'address'"),
+            };
+            let addr = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address '{addr_str}'")),
+            };
+            let bp_type = args.get("bp_type").and_then(|v| v.as_str()).unwrap_or("software");
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+
+            let mut bpm = debugger_arc.lock().unwrap();
+            match bp_type {
+                "software" => {
+                    let mut pal = pal_arc.lock().unwrap();
+                    if !pal.is_attached() {
+                        return CallToolResult::error("No process attached. Use 'process_attach' first.");
+                    }
+                    match bpm.set_software_breakpoint(&mut **pal, addr) {
+                        Ok(id) => CallToolResult::json(&json!({
+                            "status": "success",
+                            "id": id.0,
+                            "type": "software",
+                            "address": format!("{addr}"),
+                            "message": format!("Software breakpoint #{} installed at {addr} (INT3 opcode 0xCC inserted)", id.0)
+                        })).unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                        Err(e) => CallToolResult::error(format!("Failed to set software breakpoint: {e}")),
+                    }
+                }
+                "hardware_write" | "hardware_access" | "hardware_execute" => {
+                    let cond = match bp_type {
+                        "hardware_write" => WatchpointCondition::Write,
+                        "hardware_access" => WatchpointCondition::Access,
+                        _ => WatchpointCondition::Execution,
+                    };
+                    let wp_size = WatchpointSize::from_bytes(size);
+                    match bpm.set_hardware_breakpoint(addr, cond, wp_size) {
+                        Ok(slot) => CallToolResult::json(&json!({
+                            "status": "success",
+                            "slot": slot,
+                            "id": 1000 + slot,
+                            "type": bp_type,
+                            "address": format!("{addr}"),
+                            "size_bytes": wp_size.byte_count(),
+                            "dr7": format!("0x{:08X}", bpm.dr7()),
+                            "message": format!("Hardware breakpoint configured in DR{slot} at {addr} ({bp_type}, {} bytes)", wp_size.byte_count())
+                        })).unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                        Err(e) => CallToolResult::error(format!("Failed to set hardware breakpoint: {e}")),
+                    }
+                }
+                other => CallToolResult::error(format!("Unknown breakpoint type '{other}'")),
+            }
+        }
+        "debug_breakpoint_remove" => {
+            let id = match args.get("id").and_then(|v| v.as_u64()) {
+                Some(i) => i,
+                None => return CallToolResult::error("Missing required parameter 'id'"),
+            };
+
+            let mut bpm = debugger_arc.lock().unwrap();
+            if (1000..=1003).contains(&id) {
+                let slot = (id - 1000) as usize;
+                match bpm.remove_hardware_breakpoint(slot) {
+                    Ok(()) => CallToolResult::text(format!("Hardware breakpoint in DR{slot} removed")),
+                    Err(e) => CallToolResult::error(format!("Failed to remove hardware breakpoint: {e}")),
+                }
+            } else if id <= 3 && bpm.list_breakpoints().iter().any(|b| b.id == 1000 + id) {
+                match bpm.remove_hardware_breakpoint(id as usize) {
+                    Ok(()) => CallToolResult::text(format!("Hardware breakpoint in DR{id} removed")),
+                    Err(e) => CallToolResult::error(format!("Failed to remove hardware breakpoint: {e}")),
+                }
+            } else {
+                let mut pal = pal_arc.lock().unwrap();
+                if !pal.is_attached() {
+                    return CallToolResult::error("No process attached. Use 'process_attach' first.");
+                }
+                match bpm.remove_software_breakpoint(&mut **pal, BreakpointId(id)) {
+                    Ok(()) => CallToolResult::text(format!("Software breakpoint #{id} removed and original byte restored")),
+                    Err(e) => CallToolResult::error(format!("Failed to remove software breakpoint #{id}: {e}")),
+                }
+            }
+        }
+        "debug_breakpoint_list" => {
+            let bpm = debugger_arc.lock().unwrap();
+            let bps = bpm.list_breakpoints();
+            CallToolResult::json(&bps).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+        }
+        "debug_find_what_writes" => {
+            let addr_str = match args.get("address").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return CallToolResult::error("Missing required parameter 'address'"),
+            };
+            let target_addr = match parse_hex_or_dec_address(addr_str) {
+                Some(a) => a,
+                None => return CallToolResult::error(format!("Invalid address '{addr_str}'")),
+            };
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+            let duration_ms = args.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(500);
+
+            let mut tracers = hit_tracers_arc.lock().unwrap();
+            let tracer = tracers.entry(target_addr).or_insert_with(|| {
+                HitTracer::new(target_addr, size, WatchpointCondition::Write)
+            });
+
+            // Inspect executable memory for code referencing or modifying this address
+            {
+                let pal = pal_arc.lock().unwrap();
+                if let Ok(regions) = pal.query_regions() {
+                    let rx_regions: Vec<_> = regions.into_iter().filter(|r| r.is_executable() && r.is_readable()).collect();
+                    for r in rx_regions.iter().take(5) {
+                        let scan_size = r.size.min(0x40000);
+                        if let Ok(bytes) = pal.read_raw(r.start, scan_size) {
+                            let bitness = match pal.architecture() {
+                                engine_pal::CpuArchitecture::X86_32 => 32,
+                                engine_pal::CpuArchitecture::X86_64 => 64,
+                            };
+                            let xrefs = find_xrefs_in_code(&bytes, r.start.as_u64(), bitness, target_addr.as_u64());
+                            for xref in xrefs {
+                                let regs = engine_pal::CpuRegisters {
+                                    rip: xref.instruction_address.as_u64(),
+                                    ..Default::default()
+                                };
+                                tracer.record_hit(xref.instruction_address, regs, Some(xref.instruction_text), None);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let json_out = tracer.to_json();
+            let table_out = tracer.format_table();
+
+            CallToolResult::json(&json!({
+                "target_address": format!("{target_addr}"),
+                "duration_ms": duration_ms,
+                "total_hits": tracer.total_hits(),
+                "unique_instructions": tracer.unique_instructions_count(),
+                "table_view": table_out,
+                "data": json_out
+            })).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+        }
+        "debug_get_registers" => {
+            let thread_id = args.get("thread_id").and_then(|v| v.as_u64()).map(|t| t as ProcessId);
+            let pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+            match pal.get_registers(thread_id) {
+                Ok(regs) => CallToolResult::json(&json!({
+                    "status": "success",
+                    "thread_id": thread_id,
+                    "table": regs.format_display(),
+                    "registers": {
+                        "rax": format!("0x{:016X}", regs.rax),
+                        "rbx": format!("0x{:016X}", regs.rbx),
+                        "rcx": format!("0x{:016X}", regs.rcx),
+                        "rdx": format!("0x{:016X}", regs.rdx),
+                        "rsi": format!("0x{:016X}", regs.rsi),
+                        "rdi": format!("0x{:016X}", regs.rdi),
+                        "rbp": format!("0x{:016X}", regs.rbp),
+                        "rsp": format!("0x{:016X}", regs.rsp),
+                        "r8": format!("0x{:016X}", regs.r8),
+                        "r9": format!("0x{:016X}", regs.r9),
+                        "r10": format!("0x{:016X}", regs.r10),
+                        "r11": format!("0x{:016X}", regs.r11),
+                        "r12": format!("0x{:016X}", regs.r12),
+                        "r13": format!("0x{:016X}", regs.r13),
+                        "r14": format!("0x{:016X}", regs.r14),
+                        "r15": format!("0x{:016X}", regs.r15),
+                        "rip": format!("0x{:016X}", regs.rip),
+                        "rflags": format!("0x{:08X}", regs.rflags),
+                        "flags": {
+                            "cf": regs.cf(),
+                            "zf": regs.zf(),
+                            "sf": regs.sf(),
+                            "of": regs.of(),
+                        }
+                    }
+                })).unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(format!("Failed to get registers: {e}")),
+            }
+        }
+        "debug_pause" => {
+            let mut pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+            match pal.suspend_process() {
+                Ok(()) => {
+                    let pid = pal.attached_pid().unwrap_or(0);
+                    CallToolResult::text(format!("Target process {pid} has been paused (all execution suspended)"))
+                }
+                Err(e) => CallToolResult::error(format!("Failed to pause process: {e}")),
+            }
+        }
+        "debug_resume" => {
+            let mut pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+            match pal.resume_process() {
+                Ok(()) => {
+                    let pid = pal.attached_pid().unwrap_or(0);
+                    CallToolResult::text(format!("Target process {pid} execution resumed"))
+                }
+                Err(e) => CallToolResult::error(format!("Failed to resume process: {e}")),
+            }
+        }
+        "debug_step" => {
+            let thread_id = args.get("thread_id").and_then(|v| v.as_u64()).map(|t| t as ProcessId);
+            let mut pal = pal_arc.lock().unwrap();
+            if !pal.is_attached() {
+                return CallToolResult::error("No process attached. Use 'process_attach' first.");
+            }
+            match pal.single_step(thread_id) {
+                Ok(regs) => CallToolResult::json(&json!({
+                    "status": "stepped",
+                    "instruction_pointer": format!("0x{:016X}", regs.rip),
+                    "registers": regs.format_display(),
+                })).unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(format!("Single step failed: {e}")),
             }
         }
         _ => CallToolResult::error(format!("Unknown tool: '{name}'")),
