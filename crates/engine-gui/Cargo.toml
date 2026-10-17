@@ -1,0 +1,25 @@
+[package]
+name = "engine-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "engine-plus"
+path = "src/main.rs"
+
+[dependencies]
+engine-core.workspace = true
+engine-pal.workspace = true
+engine-mcp.workspace = true
+engine-script.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_dock.workspace = true
+egui_extras.workspace = true
+catppuccin-egui.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

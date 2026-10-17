@@ -1,0 +1,21 @@
+[package]
+name = "engine-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "engine-plus-cli"
+path = "src/main.rs"
+
+[dependencies]
+engine-core.workspace = true
+engine-pal.workspace = true
+engine-mcp.workspace = true
+engine-script.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "engine-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+engine-pal.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+byteorder.workspace = true
+bitflags.workspace = true
+crossbeam-channel.workspace = true
+tokio.workspace = true
+iced-x86.workspace = true

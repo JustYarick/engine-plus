@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/engine-pal",
+    "crates/engine-core",
+    "crates/engine-mcp",
+    "crates/engine-script",
+    "crates/engine-cli",
+    "crates/engine-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Yarick <yarick@engine-plus.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/engine-plus/engine_plus"
+
+[workspace.dependencies]
+# Internal crates
+engine-pal = { path = "crates/engine-pal" }
+engine-core = { path = "crates/engine-core" }
+engine-mcp = { path = "crates/engine-mcp" }
+engine-script = { path = "crates/engine-script" }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging and Diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async & Concurrency
+tokio = { version = "1.40", features = ["full"] }
+rayon = "1.10"
+crossbeam-channel = "0.5"
+
+# Binary and Memory utilities
+byteorder = "1.5"
+bitflags = { version = "2.6", features = ["serde"] }
+
+# Low-level OS
+libc = "0.2"
+nix = { version = "0.29", features = ["process", "mman", "ptrace", "signal", "uio", "fs"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Scripting
+mlua = { version = "0.9", features = ["lua54", "vendored", "async"] }
+
+# Disassembly & Architecture
+iced-x86 = { version = "1.21", features = ["std", "decoder", "intel", "gas", "masm", "nasm"] }
+
+# GUI
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["all_loaders"] }
+egui_dock = "0.14"
+catppuccin-egui = "5.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

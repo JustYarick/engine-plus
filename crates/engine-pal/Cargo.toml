@@ -1,0 +1,20 @@
+[package]
+name = "engine-pal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+bitflags.workspace = true
+byteorder.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+nix.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# windows-sys will be added when implementing windows backend
