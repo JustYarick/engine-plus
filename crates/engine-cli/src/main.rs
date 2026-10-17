@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand};
 use engine_core::{FirstScanMode, MemoryScanner, ScanConfig, ScanValue, ScanValueType};
 use engine_pal::{default_backend, default_enumerator, ProcessId};
-use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(name = "engine-plus-cli")]
@@ -59,8 +58,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if cli.mcp {
-        info!("Starting Engine+ standard MCP server over stdio...");
-        // MCP loop will be invoked here in Stage 5
+        let server = engine_mcp::McpServer::new();
+        server.run_stdio().await?;
         return Ok(());
     }
 
