@@ -166,6 +166,46 @@ pub fn list_tools() -> Vec<Tool> {
                 "required": ["code"]
             }),
         },
+        Tool {
+            name: "file_analyze_binary".to_string(),
+            description: "Statically analyze an executable or library file on disk (.exe, .dll, ELF) without running it. Extracts headers, architecture, entry point, ImageBase, and section map with protections.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute or relative file path to the binary" }
+                },
+                "required": ["path"]
+            }),
+        },
+        Tool {
+            name: "file_extract_strings".to_string(),
+            description: "Extract ASCII/UTF-8 strings from a static binary file with offset tracking and token-budget filtering (great for finding class names, URLs, error logs, and function names).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to binary file" },
+                    "min_len": { "type": "integer", "default": 5, "description": "Minimum string length" },
+                    "max_results": { "type": "integer", "default": 100, "description": "Maximum number of strings to return" },
+                    "filter": { "type": "string", "description": "Optional substring filter" }
+                },
+                "required": ["path"]
+            }),
+        },
+        Tool {
+            name: "file_disassemble_rva".to_string(),
+            description: "Disassemble machine code directly from a static binary file on disk given an RVA (Relative Virtual Address) or raw file offset.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to binary file" },
+                    "rva": { "type": "string", "description": "Hex RVA address (e.g. '0x1500') to disassemble" },
+                    "offset": { "type": "string", "description": "Alternative raw file hex offset (e.g. '0x400')" },
+                    "size": { "type": "integer", "default": 64, "description": "Number of bytes to disassemble (default: 64, max: 512)" },
+                    "bitness": { "type": "integer", "enum": [32, 64], "default": 64, "description": "Architecture bitness" }
+                },
+                "required": ["path"]
+            }),
+        },
     ]
 }
 
@@ -531,6 +571,74 @@ pub fn dispatch_tool_call(
                     }
                 }
                 Err(e) => CallToolResult::error(format!("Failed to initialize Lua sandbox: {e}")),
+            }
+        }
+        "file_analyze_binary" => {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return CallToolResult::error("Missing parameter 'path'"),
+            };
+            match crate::static_analyzer::analyze_file(std::path::Path::new(path_str)) {
+                Ok(result) => {
+                    CallToolResult::json(&result).unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                }
+                Err(e) => CallToolResult::error(e),
+            }
+        }
+        "file_extract_strings" => {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return CallToolResult::error("Missing parameter 'path'"),
+            };
+            let min_len = args.get("min_len").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+            let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+            let filter = args.get("filter").and_then(|v| v.as_str());
+
+            match crate::static_analyzer::extract_strings_from_file(
+                std::path::Path::new(path_str),
+                min_len,
+                max_results,
+                filter,
+            ) {
+                Ok(strings) => CallToolResult::json(&json!({
+                    "count": strings.len(),
+                    "strings": strings
+                }))
+                .unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(e),
+            }
+        }
+        "file_disassemble_rva" => {
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return CallToolResult::error("Missing parameter 'path'"),
+            };
+            let bitness = args.get("bitness").and_then(|v| v.as_u64()).unwrap_or(64) as u32;
+            let size = args.get("size").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
+
+            let (rva_or_offset, is_rva) = if let Some(rva_s) = args.get("rva").and_then(|v| v.as_str()) {
+                match parse_hex_or_dec_address(rva_s) {
+                    Some(a) => (a.as_u64(), true),
+                    None => return CallToolResult::error(format!("Invalid RVA address: '{rva_s}'")),
+                }
+            } else if let Some(off_s) = args.get("offset").and_then(|v| v.as_str()) {
+                match parse_hex_or_dec_address(off_s) {
+                    Some(a) => (a.as_u64(), false),
+                    None => return CallToolResult::error(format!("Invalid offset: '{off_s}'")),
+                }
+            } else {
+                return CallToolResult::error("Either 'rva' or 'offset' parameter must be provided");
+            };
+
+            match crate::static_analyzer::disassemble_file_code(
+                std::path::Path::new(path_str),
+                rva_or_offset,
+                is_rva,
+                size,
+                bitness,
+            ) {
+                Ok(asm_text) => CallToolResult::text(asm_text),
+                Err(e) => CallToolResult::error(e),
             }
         }
         _ => CallToolResult::error(format!("Unknown tool: '{name}'")),

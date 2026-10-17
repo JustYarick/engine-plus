@@ -2,6 +2,7 @@ pub mod error;
 pub mod optimizer;
 pub mod protocol;
 pub mod server;
+pub mod static_analyzer;
 pub mod tools;
 
 pub use error::{McpError, McpResult};
