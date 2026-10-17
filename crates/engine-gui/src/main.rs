@@ -1,11 +1,22 @@
-use tracing::info;
+use eframe::NativeOptions;
+use egui::ViewportBuilder;
+use engine_gui::EngineApp;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt::init();
-    info!("Engine+ IDE launching...");
+    tracing::info!("Starting Engine+ IDE...");
 
-    println!("Engine+ Desktop IDE v0.1.0");
-    // eframe GUI loop will be invoked here in Stage 6
+    let options = NativeOptions {
+        viewport: ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([850.0, 550.0])
+            .with_title("Engine+ — Modern Reverse Engineering IDE"),
+        ..Default::default()
+    };
 
-    Ok(())
+    eframe::run_native(
+        "engine-plus",
+        options,
+        Box::new(|cc| Ok(Box::new(EngineApp::new(cc)))),
+    )
 }
