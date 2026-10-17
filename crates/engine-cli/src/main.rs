@@ -10,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "engine-plus")]
 #[command(author = "Yarick <yarick@engine-plus.dev>")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Engine+ — High-Performance Reverse Engineering Suite & MCP Server in Rust", long_about = None)]
 struct Cli {
     #[command(subcommand)]

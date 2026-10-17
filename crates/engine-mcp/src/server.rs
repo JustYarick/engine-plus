@@ -79,7 +79,7 @@ impl McpServer {
                     },
                     server_info: Implementation {
                         name: "engine-plus-mcp".to_string(),
-                        version: "0.1.0".to_string(),
+                        version: env!("CARGO_PKG_VERSION").to_string(),
                     },
                 };
                 Some(JsonRpcResponse::success(id, json!(init_result)))

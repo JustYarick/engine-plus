@@ -21,8 +21,7 @@ cargo build --release --bin engine-plus
 # 2. Install binary to ~/.local/bin
 echo "[2/4] Installing binary to ${TARGET_BIN}..."
 mkdir -p "${BIN_DIR}"
-cp -f "${SCRIPT_DIR}/target/release/engine-plus" "${TARGET_BIN}"
-chmod +x "${TARGET_BIN}"
+install -m 755 "${SCRIPT_DIR}/target/release/engine-plus" "${TARGET_BIN}"
 
 # 3. Check PATH
 echo "[3/4] Checking PATH configuration..."
@@ -51,7 +50,7 @@ fi
 
 echo ""
 echo "=================================================================="
-echo "  🎉 Engine+ v0.1.0 successfully installed!"
+echo "  🎉 Engine+ v0.2.0 successfully installed!"
 echo "=================================================================="
 echo "  Executable: ${TARGET_BIN}"
 echo "  Interactive REPL:  engine-plus console"
