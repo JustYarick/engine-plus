@@ -1,4 +1,7 @@
 /target
 **/*.rs.bk
-Cargo.lock
 *.log
+*.tmp
+*.swp
+.idea/
+.vscode/

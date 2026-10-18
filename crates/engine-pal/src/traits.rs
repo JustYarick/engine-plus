@@ -1,7 +1,8 @@
 use crate::error::PalResult;
 use crate::types::{
     Address, BreakpointId, BreakpointType, CpuArchitecture, CpuRegisters, DebugHit, MemoryRegion,
-    ModuleInfo, ProcessEntry, ProcessId, ProtectionFlags, StealthLevel, ThreadInfo,
+    ModuleInfo, ProcessEntry, ProcessId, ProtectionFlags, RemoteThreadHandle, StealthLevel,
+    ThreadInfo,
 };
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -105,6 +106,147 @@ pub trait ProcessAccessLayer: Send + Sync {
 
     /// Free allocated virtual memory in target process
     fn free_memory(&self, address: Address) -> PalResult<()>;
+
+    /// Change page protection over a memory range, returning the previous protection.
+    ///
+    /// This is a core primitive for manual-mapping (setting per-section
+    /// protections) and unhooking (temporarily making `.text` writable).
+    fn protect_memory(
+        &self,
+        address: Address,
+        size: usize,
+        protection: ProtectionFlags,
+    ) -> PalResult<ProtectionFlags> {
+        let _ = (address, size, protection);
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "protect_memory not implemented".to_string(),
+        })
+    }
+
+    /// Launch a thread in the target process starting at `start` with `param`.
+    ///
+    /// Returns a [`RemoteThreadHandle`] that can be waited on with
+    /// [`ProcessAccessLayer::wait_for_thread`].
+    fn create_remote_thread(
+        &self,
+        _start: Address,
+        _param: Address,
+    ) -> PalResult<RemoteThreadHandle> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "create_remote_thread not implemented".to_string(),
+        })
+    }
+
+    /// Wait for a remote thread to finish and return its 32-bit exit code.
+    fn wait_for_thread(&self, _thread: RemoteThreadHandle, _timeout_ms: u64) -> PalResult<u32> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "wait_for_thread not implemented".to_string(),
+        })
+    }
+
+    /// Close a remote thread handle obtained from [`create_remote_thread`].
+    fn close_remote_thread(&self, _thread: RemoteThreadHandle) -> PalResult<()> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "close_remote_thread not implemented".to_string(),
+        })
+    }
+
+    /// Invoke a function inside the target process with up to 6 arguments,
+    /// returning the raw 64-bit register result.
+    ///
+    /// On Linux this is implemented with a ptrace register-context swap; on
+    /// Windows it is *not* directly supported (remote threads only pass a
+    /// single parameter) and callers should use `create_remote_thread` or the
+    /// higher-level [`ProcessAccessLayer::remote_load_library`].
+    fn remote_call(&self, _func: Address, _args: &[u64]) -> PalResult<u64> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "remote_call not implemented".to_string(),
+        })
+    }
+
+    /// Load a dynamic library into the target process by absolute path and
+    /// return its resolved base address.
+    ///
+    /// Higher-level convenience used by classic `LoadLibrary` / `dlopen`
+    /// injection. Implementations must resolve the *full* 64-bit base rather
+    /// than trusting a truncated 32-bit thread exit code.
+    fn remote_load_library(&self, _path: &str) -> PalResult<Address> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "remote_load_library not implemented".to_string(),
+        })
+    }
+
+    /// Mark a thread so it no longer reports debug events to any attached
+    /// debugger (Windows: `ThreadHideFromDebugger`).
+    fn hide_thread(&self, _thread_id: u32) -> PalResult<()> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "hide_thread not implemented".to_string(),
+        })
+    }
+
+    /// Read a pristine, memory-mapped copy of a system module's image.
+    ///
+    /// On Windows this maps the module's `\KnownDlls\<name>` section; the
+    /// returned buffer is a *mapped view* (sections already at their virtual
+    /// addresses), suitable for byte-for-byte comparison against a live
+    /// module as part of unhooking. Platforms without an equivalent return
+    /// `NotSupported`.
+    fn read_system_module_image(&self, _name: &str) -> PalResult<Vec<u8>> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "read_system_module_image not implemented".to_string(),
+        })
+    }
+
+    /// Allocate target memory backed by a page-file section, so the region
+    /// reports as `MEM_MAPPED` rather than `MEM_PRIVATE`.
+    fn allocate_mapped_memory(
+        &self,
+        _size: usize,
+        _protection: ProtectionFlags,
+    ) -> PalResult<Address> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "allocate_mapped_memory not implemented".to_string(),
+        })
+    }
+
+    /// Convert an existing private region at `address` into a section-backed
+    /// mapping of the same size, returning the mapped base.
+    ///
+    /// The region is briefly released before the section view is created at
+    /// the same address, so the target must be suspended or cooperative.
+    fn remap_as_section(&self, _address: Address, _size: usize) -> PalResult<Address> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "remap_as_section not implemented".to_string(),
+        })
+    }
+
+    /// Duplicate a handle owned by the current process into `target_pid`
+    /// (openable with `PROCESS_DUP_HANDLE`), closing the local copy.
+    /// Returns the handle value valid in the target process.
+    fn stash_handle(&self, _handle: u64, _target_pid: u32) -> PalResult<u64> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "stash_handle not implemented".to_string(),
+        })
+    }
+
+    /// Duplicate a handle from `source_pid` back into the current process.
+    fn unstash_handle(&self, _remote_handle: u64, _source_pid: u32) -> PalResult<u64> {
+        Err(crate::error::PalError::NotSupported {
+            backend: self.backend_name(),
+            feature: "unstash_handle not implemented".to_string(),
+        })
+    }
 
     /// Get stealth rating of this backend
     fn stealth_level(&self) -> StealthLevel;

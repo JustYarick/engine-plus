@@ -1,4 +1,4 @@
-# 🏗️ Архитектура Engine+
+# ️ Архитектура Engine+
 
 ## Обзор
 
@@ -11,19 +11,19 @@ Engine+ построен по принципу **слоёной архитект
 
 ```mermaid
 flowchart TD
-    subgraph UI["🖥️ UI Layer"]
+    subgraph UI["️ UI Layer"]
         GUI["GUI (egui/iced)"]
         CLI["CLI Interface"]
         TUI["TUI (ratatui)"]
     end
 
-    subgraph MCP_LAYER["🤖 MCP Layer"]
+    subgraph MCP_LAYER[" MCP Layer"]
         MCP_SERVER["MCP Server"]
         AI_CACHE["Token Cache & Optimizer"]
         TOOL_REGISTRY["Tool Registry"]
     end
 
-    subgraph CORE["⚙️ Core Engine"]
+    subgraph CORE["️ Core Engine"]
         SCANNER["Memory Scanner"]
         DEBUGGER["Debugger Engine"]
         DISASM["Disassembler"]
@@ -36,7 +36,7 @@ flowchart TD
         TABLE_MANAGER["Cheat Table Manager"]
     end
 
-    subgraph BACKEND["🔧 Backend Layer (PAL)"]
+    subgraph BACKEND[" Backend Layer (PAL)"]
         PAL_TRAIT["ProcessAccessLayer Trait"]
         USERMODE["Usermode Backend"]
         DRIVER["Kernel Driver Backend"]
@@ -44,7 +44,7 @@ flowchart TD
         REMOTE["Remote Backend (Network)"]
     end
 
-    subgraph OS["🐧 OS Layer"]
+    subgraph OS[" OS Layer"]
         PTRACE["ptrace"]
         PROC_MEM["/proc/pid/mem"]
         PROCESS_VM["process_vm_readv/writev"]

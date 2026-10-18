@@ -22,6 +22,8 @@ pub struct InteractiveConsole {
     current_scan_type: ScanValueType,
     allocations: std::collections::HashMap<String, Address>,
     time_dilation: TimeDilationState,
+    /// Helper processes holding stashed handles; kept alive for the session.
+    handle_stashes: Vec<engine_inject::HandleStash>,
 }
 
 impl InteractiveConsole {
@@ -36,6 +38,7 @@ impl InteractiveConsole {
             current_scan_type: ScanValueType::I32,
             allocations: std::collections::HashMap::new(),
             time_dilation: TimeDilationState::default(),
+            handle_stashes: Vec::new(),
         }
     }
 
@@ -438,6 +441,44 @@ impl InteractiveConsole {
                         self.cmd_batch(&args)?;
                     }
                 }
+                "inject" => {
+                    if args.is_empty() {
+                        println!("Usage: inject <path.dll|path.so> [method] [--no-erase] [--no-entry]");
+                        println!("  Methods: manual_map (default), reflective_rdi, reflective_stub, auto");
+                        println!("  On Linux the object is loaded with remote dlopen.");
+                        println!("  Example: inject /tmp/cheat.so");
+                        println!("  Example: inject C:\\payload.dll reflective_rdi");
+                    } else {
+                        self.cmd_inject(&args)?;
+                    }
+                }
+                "unhook" => {
+                    let module = args.first().copied().unwrap_or("ntdll.dll");
+                    self.cmd_unhook(module)?;
+                }
+                "hidethread" | "hide_thread" => {
+                    if args.is_empty() {
+                        println!("Usage: hidethread <tid> | hidethread all");
+                    } else {
+                        self.cmd_hide_thread(&args)?;
+                    }
+                }
+                "hidemem" | "hide_memory" => {
+                    if args.len() < 2 {
+                        println!("Usage: hidemem <addr> <size>");
+                        println!("  Example: hidemem 0x7FFF1000 4096");
+                    } else {
+                        self.cmd_hide_mem(&args)?;
+                    }
+                }
+                "hidehandle" | "hide_handle" => {
+                    if args.is_empty() {
+                        println!("Usage: hidehandle <handle> [helper_exe]");
+                        println!("  Example: hidehandle 0x1A4");
+                    } else {
+                        self.cmd_hide_handle(&args)?;
+                    }
+                }
                 _ => {
                     println!("Unknown command: '{cmd}'. Type 'help' for available commands.");
                 }
@@ -458,6 +499,11 @@ impl InteractiveConsole {
         println!("  structlayout <name|--all>   - Inspect struct layout or list structs from DWARF");
         println!("  diff <addr> [size] [ms]     - Diff structure in memory over time (detect changing fields)");
         println!("  batch <expr1> [expr2...]    - Batch read memory and pointer chains in one shot");
+        println!("  inject <path> [method]      - Inject a DLL/.so (manual_map, reflective_rdi, reflective_stub, auto)");
+        println!("  unhook [module]             - Restore inline hooks in a system module from KnownDlls (default ntdll.dll)");
+        println!("  hidethread <tid|all>        - Hide a thread from the debugger (ThreadHideFromDebugger)");
+        println!("  hidemem <addr> <size>       - Back a memory region with a section so it reports as MEM_MAPPED");
+        println!("  hidehandle <handle> [exe]   - Move a handle into a helper process (handle stashing)");
         println!("  scan <val> <type> [align]   - Perform first memory scan (e.g. 'scan 100 i32')");
         println!("  next <val|mode>             - Filter scan results (exact, changed, unchanged, increased)");
         println!("  results [limit]             - Display found scan addresses (default 20)");
@@ -557,6 +603,9 @@ impl InteractiveConsole {
         println!("  Backend:      {}", self.pal.backend_name());
         println!("  Architecture: {:?}", self.pal.architecture());
         println!("  Stealth:      {:?}", self.pal.stealth_level());
+        if !self.handle_stashes.is_empty() {
+            println!("  Stashed handles (helper processes): {}", self.handle_stashes.len());
+        }
 
         let regions = self.pal.query_regions()?;
         println!("  Mapped Memory Regions: {}", regions.len());
@@ -1526,6 +1575,174 @@ impl InteractiveConsole {
                 }
                 Err(e) => println!("  [#{}] {} => Error: {}", idx + 1, expr, e),
             }
+        }
+        Ok(())
+    }
+
+    /// `inject <path> [method] [--no-erase] [--no-entry]`
+    fn cmd_inject(&self, args: &[&str]) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let path = args[0];
+        let method = args
+            .get(1)
+            .copied()
+            .filter(|a| !a.starts_with("--"))
+            .unwrap_or("auto");
+        let options = engine_inject::InjectOptions {
+            method: engine_inject::InjectMethod::parse(method)
+                .ok_or_else(|| anyhow::anyhow!("Unknown injection method '{method}'"))?,
+            erase_headers: !args.contains(&"--no-erase"),
+            call_entry_point: !args.contains(&"--no-entry"),
+        };
+
+        match engine_inject::inject_file(&*self.pal, path, options) {
+            Ok(out) => {
+                println!(
+                    "Injected '{path}' via {}{}",
+                    out.method,
+                    if out.temporary {
+                        " (temporary object unlinked after mapping)"
+                    } else {
+                        ""
+                    }
+                );
+                println!("  Base:                {}", out.base);
+                if let Some(rva) = out.loader_rva {
+                    println!("  Loader RVA:          0x{rva:X}");
+                }
+                if let Some(len) = out.stub_len {
+                    println!("  Stub length:         {len} bytes");
+                }
+                if let Some(size) = out.size_of_image {
+                    println!("  Size of image:       {size} bytes");
+                }
+                if let Some(ep) = out.entry_point {
+                    println!("  Entry point:         {ep}");
+                }
+                if let Some(n) = out.relocations_applied {
+                    println!("  Relocations applied: {n}");
+                }
+                if let Some(n) = out.imports_resolved {
+                    println!("  Imports resolved:    {n}");
+                }
+                if let Some(n) = out.dependencies_loaded {
+                    println!("  Dependencies loaded: {n}");
+                }
+            }
+            Err(e) => anyhow::bail!("Injection failed: {e}"),
+        }
+        Ok(())
+    }
+
+    /// `unhook [module]`
+    fn cmd_unhook(&self, module: &str) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let unhooker = engine_inject::Unhooker::new(&*self.pal);
+        match unhooker.unhook_module(module) {
+            Ok(rep) => {
+                println!("Restored '{module}' from its pristine image:");
+                println!("  Base:             {}", rep.base);
+                println!("  Sections scanned: {}", rep.sections_scanned);
+                println!("  Regions patched:  {}", rep.regions_patched);
+                println!("  Bytes restored:   {}", rep.bytes_restored);
+            }
+            Err(e) => println!("Unhook failed: {e}"),
+        }
+        Ok(())
+    }
+
+    /// `hidethread <tid|all>`
+    fn cmd_hide_thread(&self, args: &[&str]) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let hider = engine_inject::StealthHider::new(&*self.pal);
+        if args[0].eq_ignore_ascii_case("all") {
+            let threads = self.pal.enumerate_threads()?;
+            let mut hidden = 0usize;
+            let mut failed = 0usize;
+            for t in &threads {
+                if hider.hide_thread(t.id).is_ok() {
+                    hidden += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            println!(
+                "Hid {hidden}/{} thread(s) from debuggers ({failed} failed)",
+                threads.len()
+            );
+        } else {
+            let tid: u32 = args[0]
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid thread id '{}'", args[0]))?;
+            match hider.hide_thread(tid) {
+                Ok(()) => println!("Thread {tid} no longer reports debug events"),
+                Err(e) => println!("hide_thread failed: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// `hidemem <addr> <size>`
+    fn cmd_hide_mem(&self, args: &[&str]) -> anyhow::Result<()> {
+        if !self.pal.is_attached() {
+            anyhow::bail!("Attach to a process first ('attach <pid>')");
+        }
+        let addr = parse_hex_or_dec(args[0])
+            .ok_or_else(|| anyhow::anyhow!("Invalid address '{}'", args[0]))?;
+        let size = parse_hex_or_dec(args[1])
+            .ok_or_else(|| anyhow::anyhow!("Invalid size '{}'", args[1]))?;
+        let hider = engine_inject::StealthHider::new(&*self.pal);
+        match hider.hide_memory_region(Address::new(addr), size as usize) {
+            Ok(mapped) => {
+                println!(
+                    "Region {} ({} bytes) is now backed by a page-file section (MEM_MAPPED)",
+                    Address::new(addr),
+                    size
+                );
+                println!("  New mapping: {mapped}");
+            }
+            Err(e) => println!("hide_memory failed: {e}"),
+        }
+        Ok(())
+    }
+
+    /// `hidehandle <handle> [helper_exe]`
+    fn cmd_hide_handle(&mut self, args: &[&str]) -> anyhow::Result<()> {
+        let handle = parse_hex_or_dec(args[0])
+            .ok_or_else(|| anyhow::anyhow!("Invalid handle '{}'", args[0]))?;
+        let helper = args.get(1).copied();
+
+        #[cfg(target_os = "windows")]
+        {
+            let mut stash = match helper {
+                Some(h) => engine_inject::HandleStash::spawn(h),
+                None => engine_inject::HandleStash::spawn_self(),
+            }
+            .map_err(|e| anyhow::anyhow!("Failed to spawn helper: {e}"))?;
+
+            match stash.stash(&*self.pal, handle) {
+                Ok(id) => {
+                    println!(
+                        "Handle {handle:#X} stashed as id {id} in helper PID {}",
+                        stash.pid()
+                    );
+                    println!("  The handle no longer appears in this process's handle table.");
+                    self.handle_stashes.push(stash);
+                }
+                Err(e) => println!("hide_handle failed: {e}"),
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (handle, helper);
+            println!("hide_handle (handle stashing) requires Windows DuplicateHandle.");
         }
         Ok(())
     }

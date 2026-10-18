@@ -29,6 +29,8 @@ pub struct EngineSession {
     pub hit_tracers: Arc<Mutex<HashMap<Address, HitTracer>>>,
     pub time_dilation: Arc<Mutex<TimeDilationState>>,
     pub snapshots: Arc<Mutex<SnapshotMap>>,
+    /// Helper processes holding stashed handles for the session lifetime.
+    pub handle_stashes: Arc<Mutex<Vec<engine_inject::HandleStash>>>,
 }
 
 impl EngineSession {
@@ -48,6 +50,7 @@ impl EngineSession {
         let hit_tracers = Arc::new(Mutex::new(HashMap::new()));
         let time_dilation = Arc::new(Mutex::new(TimeDilationState::default()));
         let snapshots = Arc::new(Mutex::new(HashMap::new()));
+        let handle_stashes = Arc::new(Mutex::new(Vec::new()));
 
         EngineSession {
             pal,
@@ -58,6 +61,7 @@ impl EngineSession {
             hit_tracers,
             time_dilation,
             snapshots,
+            handle_stashes,
         }
     }
 }
@@ -641,6 +645,70 @@ pub fn list_tools() -> Vec<Tool> {
                 "required": ["address"]
             }),
         },
+        Tool {
+            name: "inject_dll".to_string(),
+            description: "Inject a DLL (Windows) or .so (Linux) into the attached process. Supports manual mapping, reflective loading (RDI export or a runtime-assembled PIC stub) and optional PE header erasure. On Linux the object is loaded via remote dlopen.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the DLL (.dll) or shared object (.so) to inject" },
+                    "method": {
+                        "type": "string",
+                        "enum": ["manual_map", "reflective_rdi", "reflective_stub", "auto"],
+                        "default": "manual_map",
+                        "description": "Injection strategy. 'auto' picks reflective_rdi if the DLL exports ReflectiveLoader, else manual_map. Ignored on Linux."
+                    },
+                    "erase_headers": { "type": "boolean", "default": true, "description": "Zero the PE headers after manual mapping" },
+                    "call_entry_point": { "type": "boolean", "default": true, "description": "Call DllMain in a remote thread after mapping" }
+                },
+                "required": ["path"]
+            }),
+        },
+        Tool {
+            name: "unhook_ntdll".to_string(),
+            description: "Restore inline hooks in a system module's executable sections by rewriting them from the pristine \\KnownDlls image (Windows). Defaults to ntdll.dll. Generic: it does not target any specific product.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "module": { "type": "string", "default": "ntdll.dll", "description": "Name of the loaded module to restore" }
+                }
+            }),
+        },
+        Tool {
+            name: "hide_thread".to_string(),
+            description: "Clear a thread's debug reporting so it stops emitting debug events (Windows ThreadHideFromDebugger). Provide a thread_id, or all=true to hide every thread in the target.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread_id": { "type": "integer", "description": "Target thread ID" },
+                    "all": { "type": "boolean", "default": false, "description": "Hide every thread in the attached process" }
+                }
+            }),
+        },
+        Tool {
+            name: "hide_memory".to_string(),
+            description: "Back an existing private memory region with a page-file section so it reports as MEM_MAPPED instead of MEM_PRIVATE (Windows). The target should be suspended; the region is briefly released before remapping.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Start address (hex or decimal)" },
+                    "size": { "type": "integer", "description": "Region size in bytes" }
+                },
+                "required": ["address", "size"]
+            }),
+        },
+        Tool {
+            name: "hide_handle".to_string(),
+            description: "Move a handle out of this process into a helper (stash) process via DuplicateHandle, so it no longer appears in the local handle table (Windows). Reversible. Kernel-level handle hiding is out of scope.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "handle": { "type": "string", "description": "Handle value to stash (hex or decimal)" },
+                    "helper": { "type": "string", "description": "Path to a long-lived helper executable to hold the handle (defaults to a system binary)" }
+                },
+                "required": ["handle"]
+            }),
+        },
     ]
 }
 
@@ -651,7 +719,7 @@ pub fn dispatch_tool_call(
     args: Option<Value>,
 ) -> CallToolResult {
     let args = args.unwrap_or(json!({}));
-    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc, debugger_arc, hit_tracers_arc, time_dilation_arc, snapshots_arc) = {
+    let (pal_arc, scanner_arc, script_engine_arc, aa_allocs_arc, debugger_arc, hit_tracers_arc, time_dilation_arc, snapshots_arc, stashes_arc) = {
         let s = session_arc.lock().unwrap();
         (
             Arc::clone(&s.pal),
@@ -662,6 +730,7 @@ pub fn dispatch_tool_call(
             Arc::clone(&s.hit_tracers),
             Arc::clone(&s.time_dilation),
             Arc::clone(&s.snapshots),
+            Arc::clone(&s.handle_stashes),
         )
     };
 
@@ -2408,6 +2477,214 @@ pub fn dispatch_tool_call(
                 }
             } else {
                 CallToolResult::error("Either 'duration_ms' or 'snapshot_id' must be specified for struct_diff")
+            }
+        }
+        "inject_dll" => {
+            let path = match args.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return CallToolResult::error("Missing required parameter 'path'"),
+            };
+            let options = engine_inject::InjectOptions {
+                method: args
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .and_then(engine_inject::InjectMethod::parse)
+                    .unwrap_or(engine_inject::InjectMethod::Auto),
+                erase_headers: args
+                    .get("erase_headers")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                call_entry_point: args
+                    .get("call_entry_point")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            };
+            let pal = pal_arc.lock().unwrap();
+            if pal.attached_pid().is_none() {
+                return CallToolResult::error(
+                    "Not attached to any process. Call process_attach first.",
+                );
+            }
+            match engine_inject::inject_file(&**pal, path, options) {
+                Ok(out) => CallToolResult::json(&json!({
+                    "status": "injected",
+                    "method": out.method,
+                    "path": path,
+                    "base": format!("0x{:X}", out.base.as_u64()),
+                    "loader_rva": out.loader_rva,
+                    "stub_len": out.stub_len,
+                    "size_of_image": out.size_of_image,
+                    "entry_point": out.entry_point.map(|a| format!("0x{:X}", a.as_u64())),
+                    "relocations_applied": out.relocations_applied,
+                    "imports_resolved": out.imports_resolved,
+                    "dependencies_loaded": out.dependencies_loaded,
+                    "temporary": out.temporary
+                }))
+                .unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(format!("Injection failed: {e}")),
+            }
+        }
+        "unhook_ntdll" => {
+            let module = args
+                .get("module")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ntdll.dll");
+            let pal = pal_arc.lock().unwrap();
+            if pal.attached_pid().is_none() {
+                return CallToolResult::error(
+                    "Not attached to any process. Call process_attach first.",
+                );
+            }
+            let unhooker = engine_inject::Unhooker::new(&**pal);
+            match unhooker.unhook_module(module) {
+                Ok(rep) => CallToolResult::json(&json!({
+                    "status": "unhooked",
+                    "module": rep.module,
+                    "base": format!("0x{:X}", rep.base.as_u64()),
+                    "sections_scanned": rep.sections_scanned,
+                    "regions_patched": rep.regions_patched,
+                    "bytes_restored": rep.bytes_restored
+                }))
+                .unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(format!("Unhook failed: {e}")),
+            }
+        }
+        "hide_thread" => {
+            let pal = pal_arc.lock().unwrap();
+            if pal.attached_pid().is_none() {
+                return CallToolResult::error(
+                    "Not attached to any process. Call process_attach first.",
+                );
+            }
+            let hider = engine_inject::StealthHider::new(&**pal);
+            let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if all {
+                match pal.enumerate_threads() {
+                    Ok(threads) => {
+                        let mut hidden = 0usize;
+                        let mut failed = 0usize;
+                        for t in &threads {
+                            if hider.hide_thread(t.id).is_ok() {
+                                hidden += 1;
+                            } else {
+                                failed += 1;
+                            }
+                        }
+                        CallToolResult::json(&json!({
+                            "status": "done",
+                            "threads_total": threads.len(),
+                            "threads_hidden": hidden,
+                            "threads_failed": failed
+                        }))
+                        .unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+                    }
+                    Err(e) => CallToolResult::error(format!("Failed to enumerate threads: {e}")),
+                }
+            } else {
+                let tid = match args.get("thread_id").and_then(|v| v.as_u64()) {
+                    Some(t) => t as u32,
+                    None => {
+                        return CallToolResult::error(
+                            "Provide 'thread_id' or set 'all': true",
+                        )
+                    }
+                };
+                match hider.hide_thread(tid) {
+                    Ok(()) => CallToolResult::json(&json!({
+                        "status": "hidden",
+                        "thread_id": tid
+                    }))
+                    .unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                    Err(e) => CallToolResult::error(format!("hide_thread failed: {e}")),
+                }
+            }
+        }
+        "hide_memory" => {
+            let address = match args
+                .get("address")
+                .and_then(|v| v.as_str())
+                .and_then(parse_hex_or_dec_address)
+            {
+                Some(a) => a,
+                None => {
+                    return CallToolResult::error("Missing or invalid required parameter 'address'")
+                }
+            };
+            let size = match args.get("size").and_then(|v| v.as_u64()) {
+                Some(s) => s as usize,
+                None => return CallToolResult::error("Missing required parameter 'size'"),
+            };
+            let pal = pal_arc.lock().unwrap();
+            if pal.attached_pid().is_none() {
+                return CallToolResult::error(
+                    "Not attached to any process. Call process_attach first.",
+                );
+            }
+            let hider = engine_inject::StealthHider::new(&**pal);
+            match hider.hide_memory_region(address, size) {
+                Ok(mapped) => CallToolResult::json(&json!({
+                    "status": "remapped",
+                    "requested_address": format!("0x{:X}", address.as_u64()),
+                    "mapped_address": format!("0x{:X}", mapped.as_u64()),
+                    "size": size
+                }))
+                .unwrap_or_else(|e| CallToolResult::error(e.to_string())),
+                Err(e) => CallToolResult::error(format!("hide_memory failed: {e}")),
+            }
+        }
+        "hide_handle" => {
+            let handle = match args
+                .get("handle")
+                .and_then(|v| v.as_str())
+                .and_then(parse_hex_or_dec_address)
+            {
+                Some(a) => a.as_u64(),
+                None => {
+                    return CallToolResult::error("Missing or invalid required parameter 'handle'")
+                }
+            };
+            let helper = args.get("helper").and_then(|v| v.as_str());
+
+            #[cfg(target_os = "windows")]
+            {
+                let mut stash = match match helper {
+                    Some(h) => engine_inject::HandleStash::spawn(h),
+                    None => engine_inject::HandleStash::spawn_self(),
+                } {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return CallToolResult::error(format!("Failed to spawn helper: {e}"))
+                    }
+                };
+                let helper_pid = stash.pid();
+                let stash_id = {
+                    let pal = pal_arc.lock().unwrap();
+                    match stash.stash(&**pal, handle) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            return CallToolResult::error(format!("hide_handle failed: {e}"))
+                        }
+                    }
+                };
+                // Keep the helper alive for the lifetime of the session so the
+                // stashed handle (and its resource) survives.
+                stashes_arc.lock().unwrap().push(stash);
+                CallToolResult::json(&json!({
+                    "status": "stashed",
+                    "stash_id": stash_id,
+                    "helper_pid": helper_pid,
+                    "note": "Handle moved to helper process; it no longer appears in the local handle table."
+                }))
+                .unwrap_or_else(|e| CallToolResult::error(e.to_string()))
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = (handle, helper, &stashes_arc);
+                CallToolResult::error(
+                    "hide_handle (handle stashing) requires Windows DuplicateHandle",
+                )
             }
         }
         _ => CallToolResult::error(format!("Unknown tool: '{name}'")),

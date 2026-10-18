@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/engine-pal",
     "crates/engine-core",
+    "crates/engine-inject",
     "crates/engine-mcp",
     "crates/engine-script",
     "crates/engine-cli",
@@ -20,6 +21,7 @@ repository = "https://github.com/engine-plus/engine_plus"
 # Internal crates
 engine-pal = { path = "crates/engine-pal" }
 engine-core = { path = "crates/engine-core" }
+engine-inject = { path = "crates/engine-inject" }
 engine-mcp = { path = "crates/engine-mcp" }
 engine-script = { path = "crates/engine-script" }
 
@@ -54,6 +56,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
+    "Win32_Security",
+    "Wdk_Foundation",
+    "Wdk_System_Threading",
+    "Wdk_System_SystemInformation",
+    "Wdk_System_Memory",
+    "Wdk_Storage_FileSystem",
 ] }
 
 # CLI

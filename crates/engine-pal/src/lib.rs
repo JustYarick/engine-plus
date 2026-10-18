@@ -9,7 +9,7 @@ pub use traits::{MemoryReader, MemoryWriter, ProcessAccessLayer, ProcessEnumerat
 pub use types::{
     Address, BreakpointId, BreakpointType, CpuArchitecture, CpuRegisters, DebugHit,
     HardwareBreakpointSlot, MemoryRegion, ModuleInfo, ProcessEntry, ProcessId, ProtectionFlags,
-    StealthLevel, ThreadInfo, WatchpointCondition, WatchpointSize,
+    RemoteThreadHandle, StealthLevel, ThreadInfo, WatchpointCondition, WatchpointSize,
 };
 
 /// Create the default, most performant ProcessAccessLayer backend for the current OS

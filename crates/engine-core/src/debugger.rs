@@ -625,9 +625,11 @@ mod tests {
     fn test_hit_tracer_accumulation_and_formatting() {
         let mut tracer = HitTracer::new(Address::new(0x7FFF1000), 4, WatchpointCondition::Write);
 
-        let mut regs = CpuRegisters::default();
-        regs.rax = 0x7FFF1000;
-        regs.rip = 0x401020;
+        let regs = CpuRegisters {
+            rax: 0x7FFF1000,
+            rip: 0x401020,
+            ..Default::default()
+        };
 
         tracer.record_hit(Address::new(0x401020), regs, Some("mov [rax], ecx".to_string()), None);
         tracer.record_hit(Address::new(0x401020), regs, Some("mov [rax], ecx".to_string()), None);
@@ -648,8 +650,10 @@ mod tests {
     fn test_analyze_instruction_hit_with_iced() {
         // mov [rax], ecx -> 89 08
         let code = [0x89, 0x08];
-        let mut regs = CpuRegisters::default();
-        regs.rax = 0x12345678;
+        let regs = CpuRegisters {
+            rax: 0x12345678,
+            ..Default::default()
+        };
 
         let hit = HitTracer::analyze_instruction_hit(&code, 0x401000, 64, Address::new(0x12345678), regs);
         assert!(hit.is_some());

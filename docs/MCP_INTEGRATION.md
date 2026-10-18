@@ -1,4 +1,4 @@
-# 🤖 MCP Integration — Универсальный стандарт AI для Engine+
+# MCP Integration — Универсальный стандарт AI для Engine+
 
 ## Обзор
 
@@ -356,6 +356,52 @@ AI-анализ структуры данных.
   }
 }
 ```
+
+---
+
+### Категория: Injection & Stealth
+
+> Все техники — generic (manual mapping, reflective loading, снятие inline-хуков,
+> `ThreadHideFromDebugger`, handle stashing). Kernel-level (VAD/DKOM) сокрытие вне
+> области работ. Поддерживаются Windows и Linux; macOS исключён.
+
+#### `inject_dll`
+Внедрить DLL (Windows) или `.so` (Linux) в подключённый процесс.
+
+```json
+{
+  "name": "inject_dll",
+  "description": "Инъекция DLL/.so: manual_map, reflective_rdi, reflective_stub или auto",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string", "description": "Путь к .dll / .so" },
+      "method": {
+        "type": "string",
+        "enum": ["manual_map", "reflective_rdi", "reflective_stub", "auto"],
+        "default": "manual_map"
+      },
+      "erase_headers": { "type": "boolean", "default": true },
+      "call_entry_point": { "type": "boolean", "default": true }
+    },
+    "required": ["path"]
+  }
+}
+```
+
+На Linux `method` игнорируется — объект загружается удалённым `dlopen`.
+
+#### `unhook_ntdll`
+Восстановить исполняемые секции системного модуля из чистого образа `\KnownDlls` (по умолчанию `ntdll.dll`).
+
+#### `hide_thread`
+Скрыть поток от отладчика (`ThreadHideFromDebugger`): указать `thread_id` или `all: true`.
+
+#### `hide_memory`
+Перевести приватный регион памяти на секционный маппинг (`MEM_MAPPED`).
+
+#### `hide_handle`
+Перенести хэндл в процесс-помощник (handle stashing) через `DuplicateHandle`.
 
 ---
 

@@ -1,0 +1,21 @@
+[package]
+name = "engine-inject"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DLL / shared-library injection, manual mapping, reflective loading, PE header erasure, unhooking and stealth primitives for Engine+"
+
+[dependencies]
+engine-pal.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+iced-x86.workspace = true
+object.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+nix.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys.workspace = true

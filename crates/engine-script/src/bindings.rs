@@ -14,6 +14,8 @@ pub struct ScriptEngine {
     pal: Arc<Mutex<Box<dyn ProcessAccessLayer>>>,
     scanner: Arc<Mutex<MemoryScanner>>,
     allocations: Arc<Mutex<HashMap<String, Address>>>,
+    /// Helper processes holding stashed handles for the lifetime of the engine.
+    handle_stashes: Arc<Mutex<Vec<engine_inject::HandleStash>>>,
 }
 
 impl ScriptEngine {
@@ -36,6 +38,7 @@ impl ScriptEngine {
             pal,
             scanner,
             allocations,
+            handle_stashes: Arc::new(Mutex::new(Vec::new())),
         };
 
         engine.register_core_bindings()?;
@@ -357,7 +360,129 @@ impl ScriptEngine {
         }
         globals.set("assembler", asm_table)?;
 
-        // 4. auto_assemble global function
+        // 4. inject / stealth module
+        let inject_table = self.lua.create_table()?;
+        {
+            let pal = Arc::clone(&self.pal);
+            inject_table.set(
+                "dll",
+                self.lua.create_function(move |lua, (path, method): (String, Option<String>)| {
+                    let method = match method.as_deref() {
+                        Some(m) => engine_inject::InjectMethod::parse(m).ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!("Unknown injection method '{m}'"))
+                        })?,
+                        None => engine_inject::InjectMethod::Auto,
+                    };
+                    let options = engine_inject::InjectOptions {
+                        method,
+                        ..engine_inject::InjectOptions::default()
+                    };
+                    let p = pal.lock().map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                    let out = engine_inject::inject_file(&**p, &path, options)
+                        .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+
+                    let t = lua.create_table()?;
+                    t.set("method", out.method)?;
+                    t.set("base", format!("0x{:X}", out.base.as_u64()))?;
+                    t.set("loader_rva", out.loader_rva)?;
+                    t.set("stub_len", out.stub_len)?;
+                    t.set("size_of_image", out.size_of_image)?;
+                    t.set("temporary", out.temporary)?;
+                    Ok(t)
+                })?,
+            )?;
+
+            let pal = Arc::clone(&self.pal);
+            inject_table.set(
+                "unhook",
+                self.lua.create_function(move |lua, module: Option<String>| {
+                    let module = module.unwrap_or_else(|| "ntdll.dll".to_string());
+                    let p = pal.lock().map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                    let rep = engine_inject::Unhooker::new(&**p)
+                        .unhook_module(&module)
+                        .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+
+                    let t = lua.create_table()?;
+                    t.set("module", rep.module)?;
+                    t.set("base", format!("0x{:X}", rep.base.as_u64()))?;
+                    t.set("sections_scanned", rep.sections_scanned)?;
+                    t.set("regions_patched", rep.regions_patched)?;
+                    t.set("bytes_restored", rep.bytes_restored)?;
+                    Ok(t)
+                })?,
+            )?;
+
+            let pal = Arc::clone(&self.pal);
+            inject_table.set(
+                "hide_thread",
+                self.lua.create_function(move |_, tid: u32| {
+                    let p = pal.lock().map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                    engine_inject::StealthHider::new(&**p)
+                        .hide_thread(tid)
+                        .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                    Ok(())
+                })?,
+            )?;
+
+            let pal = Arc::clone(&self.pal);
+            inject_table.set(
+                "hide_memory",
+                self.lua.create_function(move |_, (addr_val, size): (Value, usize)| {
+                    let addr = parse_lua_address(&addr_val)?;
+                    let p = pal.lock().map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                    let mapped = engine_inject::StealthHider::new(&**p)
+                        .hide_memory_region(addr, size)
+                        .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                    Ok(format!("0x{:X}", mapped.as_u64()))
+                })?,
+            )?;
+
+            let pal = Arc::clone(&self.pal);
+            let stashes = Arc::clone(&self.handle_stashes);
+            inject_table.set(
+                "hide_handle",
+                self.lua.create_function(
+                    move |_lua, (handle, helper): (u64, Option<String>)| {
+                        #[cfg(target_os = "windows")]
+                        {
+                            let mut stash = match helper {
+                                Some(h) => engine_inject::HandleStash::spawn(&h),
+                                None => engine_inject::HandleStash::spawn_self(),
+                            }
+                            .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                            let helper_pid = stash.pid();
+                            let id = {
+                                let p = pal.lock().map_err(|e| {
+                                    mlua::Error::RuntimeError(e.to_string())
+                                })?;
+                                stash.stash(&**p, handle).map_err(|e| {
+                                    mlua::Error::RuntimeError(e.to_string())
+                                })?
+                            };
+                            stashes
+                                .lock()
+                                .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?
+                                .push(stash);
+
+                            let t = _lua.create_table()?;
+                            t.set("stash_id", id)?;
+                            t.set("helper_pid", helper_pid)?;
+                            Ok(t)
+                        }
+                        #[cfg(not(target_os = "windows"))]
+                        {
+                            let _ = (handle, helper, &pal, &stashes);
+                            Err::<mlua::Table, _>(mlua::Error::RuntimeError(
+                                "hide_handle requires Windows DuplicateHandle".to_string(),
+                            ))
+                        }
+                    },
+                )?,
+            )?;
+        }
+        globals.set("inject", inject_table)?;
+
+        // 5. auto_assemble global function
         {
             let pal = Arc::clone(&self.pal);
             let allocs = Arc::clone(&self.allocations);

@@ -19,6 +19,10 @@ struct Cli {
     /// Run as standard Model Context Protocol (MCP) server over stdio for AI integration
     #[arg(long)]
     mcp: bool,
+
+    /// Internal: park as a handle-stash helper process holding duplicated handles
+    #[arg(long, hide = true)]
+    stash_helper: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -511,6 +515,14 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Handle-stash helper mode: park forever while holding duplicated handles.
+    // The stashing process terminates us when the handles are no longer needed.
+    if cli.stash_helper {
+        loop {
+            std::thread::park();
+        }
+    }
 
     if cli.mcp {
         let server = engine_mcp::McpServer::new();

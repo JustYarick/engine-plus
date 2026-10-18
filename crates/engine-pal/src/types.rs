@@ -166,6 +166,17 @@ pub struct ThreadInfo {
     pub state: Option<String>,
 }
 
+/// Result of launching code inside the target process via a remote thread.
+///
+/// `exit_code` is only meaningful once the thread has been waited on and the
+/// entry point returned a 32-bit value (e.g. `LoadLibraryW` truncated on x64 —
+/// prefer `remote_load_library` which re-resolves the full 64-bit module base).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteThreadHandle {
+    /// Operating-system thread identifier (TID)
+    pub id: u32,
+}
+
 /// Target CPU architecture
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CpuArchitecture {
@@ -418,11 +429,13 @@ mod tests {
 
     #[test]
     fn test_cpu_registers_and_watchpoints() {
-        let mut regs = CpuRegisters::default();
-        regs.rax = 0x1234;
-        regs.rip = 0x7FFF0000;
-        // Set ZF (bit 6) and CF (bit 0)
-        regs.rflags = 0x0041;
+        let regs = CpuRegisters {
+            rax: 0x1234,
+            rip: 0x7FFF0000,
+            // Set ZF (bit 6) and CF (bit 0)
+            rflags: 0x0041,
+            ..CpuRegisters::default()
+        };
         assert!(regs.zf());
         assert!(regs.cf());
         assert!(!regs.sf());

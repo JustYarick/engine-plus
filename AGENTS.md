@@ -24,7 +24,7 @@ crates/
 ### Supported Platforms
 * **Linux:** Native 64-bit & 32-bit (via `process_vm_readv`, `/proc/<pid>/mem`, `ptrace_scope`), Steam Deck & Proton/Wine Windows game emulation. Requires `sudo` for full memory access.
 * **Windows:** 64-bit & 32-bit WOW64 (`OpenProcess`, `ReadProcessMemory`, `WriteProcessMemory`, `VirtualQueryEx`, Toolhelp32). Requires "Run as Administrator".
-* **macOS:** ⚠️ **STRICTLY EXCLUDED / POSTPONED.** Do not add macOS code or dependencies.
+* **macOS:** ️ **STRICTLY EXCLUDED / POSTPONED.** Do not add macOS code or dependencies.
 
 ---
 

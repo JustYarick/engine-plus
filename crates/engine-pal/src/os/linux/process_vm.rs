@@ -205,6 +205,29 @@ impl ProcessAccessLayer for ProcessVmBackend {
         super::ptrace_ops::remote_free(pid, address, 4096)
     }
 
+    fn protect_memory(
+        &self,
+        address: Address,
+        size: usize,
+        protection: ProtectionFlags,
+    ) -> PalResult<ProtectionFlags> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        // Old protection is not reported by mprotect-driven backends; return
+        // the requested protection as a best-effort value.
+        super::ptrace_ops::remote_protect(pid, address, size, protection)?;
+        Ok(protection)
+    }
+
+    fn remote_call(&self, func: Address, args: &[u64]) -> PalResult<u64> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        super::ptrace_ops::remote_call(pid, func, args)
+    }
+
+    fn remote_load_library(&self, path: &str) -> PalResult<Address> {
+        let pid = self.attached_pid.ok_or(PalError::NotAttached)?;
+        super::ptrace_ops::remote_load_library(pid, path)
+    }
+
     fn stealth_level(&self) -> StealthLevel {
         StealthLevel::Low
     }

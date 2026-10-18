@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 engine-core.workspace = true
 engine-pal.workspace = true
+engine-inject.workspace = true
 engine-script.workspace = true
 iced-x86.workspace = true
 thiserror.workspace = true

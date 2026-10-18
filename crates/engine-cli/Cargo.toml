@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 engine-core.workspace = true
 engine-pal.workspace = true
+engine-inject.workspace = true
 engine-mcp.workspace = true
 engine-script.workspace = true
 clap.workspace = true
